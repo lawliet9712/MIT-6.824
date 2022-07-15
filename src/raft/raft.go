@@ -380,8 +380,13 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		rf.electionTimeout = getRandomElectionTimeout()
 	}
 
-	// 正常情况下，重置 election time out 时间即可, 心跳超时额外加 500 ms
+	// 正常情况下，重置 election time out 时间即可
 	if rf.currentRole == ROLE_Follwer {
+		rf.electionTimeout = getRandomElectionTimeout()
+	} else if (rf.currentRole == ROLE_Candidate && rf.currentTerm == args.Term) {
+		rf.switchRole(ROLE_Follwer)
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
 		rf.electionTimeout = getRandomElectionTimeout()
 	}
 	reply.Term = rf.currentTerm
