@@ -105,7 +105,6 @@ func TestManyElections2A(t *testing.T) {
 		i1 := rand.Int() % servers
 		i2 := rand.Int() % servers
 		i3 := rand.Int() % servers
-		fmt.Printf("[TestManyElections2A] disconnect [%d] [%d] [%d]\n", i1, i2, i3)
 		cfg.disconnect(i1)
 		cfg.disconnect(i2)
 		cfg.disconnect(i3)
@@ -117,7 +116,6 @@ func TestManyElections2A(t *testing.T) {
 		cfg.connect(i1)
 		cfg.connect(i2)
 		cfg.connect(i3)
-		fmt.Printf("[TestManyElections2A] connect [%d] [%d] [%d]\n", i1, i2, i3)
 	}
 
 	cfg.checkOneLeader()
