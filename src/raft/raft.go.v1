@@ -93,7 +93,7 @@ type Raft struct {
 	currentTerm     int
 	votedFor        int
 	currentRole     ServerRole
-	electionTimeout int64 // 状态超时时间
+	heartbeatFlag   int // follwer sleep 期间
 	votedCnt        int
 }
 
@@ -199,15 +199,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.switchRole(ROLE_Follwer)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.electionTimeout = getRandomElectionTimeout()
 	}
 
 	switch rf.currentRole {
 	case ROLE_Follwer:
+		rf.heartbeatFlag = 1
 		if rf.votedFor == -1 {
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
-			rf.electionTimeout = getRandomElectionTimeout()
 		} else {
 			reply.VoteGranted = false
 		}
@@ -309,6 +308,7 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 		rf.mu.Lock()
 		currentRole := rf.currentRole
+		timeout := getRandomTimeout()
 		rf.mu.Unlock()
 		switch currentRole {
 		case ROLE_Leader:
@@ -316,17 +316,18 @@ func (rf *Raft) ticker() {
 			time.Sleep(100 * time.Millisecond)
 		case ROLE_Follwer:
 			rf.CheckHeartbeat()
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(time.Duration(timeout))
 		case ROLE_Candidate:
 			rf.StartElection()
+			time.Sleep(time.Duration(timeout))
 		}
 
 	}
 }
 
-func getRandomElectionTimeout() int64 {
+func getRandomTimeout() int64 {
 	// 150 ~ 300 ms 的误差
-	return time.Now().UnixNano() + (rand.Int63n(150) + 150) * 1000000
+	return (rand.Int63n(150) + 150) * 1000000
 }
 
 func getCurrentTime() int64 {
@@ -377,17 +378,17 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		rf.switchRole(ROLE_Follwer)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.electionTimeout = getRandomElectionTimeout()
+		rf.heartbeatFlag = 1
 	}
 
-	// 正常情况下，重置 election time out 时间即可, 心跳超时额外加 500 ms
+	// 正常情况下，重置 election time out 时间即可
 	if rf.currentRole == ROLE_Follwer {
-		rf.electionTimeout = getRandomElectionTimeout()
+		rf.heartbeatFlag = 1
 	} else if (rf.currentRole == ROLE_Candidate && rf.currentTerm == args.Term) {
 		rf.switchRole(ROLE_Follwer)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.electionTimeout = getRandomElectionTimeout()
+		rf.heartbeatFlag = 1
 	}
 	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
@@ -429,12 +430,13 @@ func (rf *Raft) SendHeartbeat() {
 func (rf *Raft) CheckHeartbeat() {
 	// 指定时间没有收到 Heartbeat
 	rf.mu.Lock()
-	if getCurrentTime() > rf.electionTimeout {
+	if rf.heartbeatFlag != 1 {
 		// 开始新的 election, 切换状态
 		// [follwer -> candidate] 1. 心跳超时，进入 election
 		//fmt.Printf("[CheckHeartbeat] id=%d role=%d term=%d not recived heart beat ... \n", rf.me, rf.currentRole, rf.currentTerm)
 		rf.switchRole(ROLE_Candidate)
 	}
+	rf.heartbeatFlag = 0 // 每次重置 heartbeat 标记
 	rf.mu.Unlock()
 }
 
@@ -444,73 +446,67 @@ func (rf *Raft) StartElection() {
 	2. 自己成为 leader
 	*/
 	rf.mu.Lock()
-	timeout := rf.electionTimeout
+	// 重置票数和超时时间
+	rf.currentTerm += 1
+	rf.votedCnt = 1
+	rf.votedFor = rf.me
+	//fmt.Printf("[StartElection] id=%d role=%d term=%d Start Election ... \n", rf.me, rf.currentRole, rf.currentTerm)
 	rf.mu.Unlock()
-	if getCurrentTime() > timeout {
-		rf.mu.Lock()
-		// 重置票数和超时时间
-		rf.currentTerm += 1
-		rf.votedCnt = 1
-		rf.votedFor = rf.me
-		rf.electionTimeout = getRandomElectionTimeout()
-		//fmt.Printf("[StartElection] id=%d role=%d term=%d Start Election ... \n", rf.me, rf.currentRole, rf.currentTerm)
-		rf.mu.Unlock()
-		// 集票阶段
-		for server, _ := range rf.peers {
-			if server == rf.me {
-				continue
+	// 集票阶段
+	for server, _ := range rf.peers {
+		if server == rf.me {
+			continue
+		}
+
+		// 由于 sendRpc 会阻塞，所以这里选择新启动 goroutine 去 sendRPC，不阻塞当前协程
+		go func(server int) {
+			rf.mu.Lock()
+			//fmt.Printf("[StartElection] id %d role %d term %d send vote req to %d\n", rf.me, rf.currentRole, rf.currentTerm, server)
+			args := RequestVoteArgs{
+				Term:        rf.currentTerm,
+				CandidateId: rf.me,
+			}
+			reply := RequestVoteReply{}
+			rf.mu.Unlock()
+			ok := rf.sendRequestVote(server, &args, &reply)
+			if !ok {
+				//fmt.Printf("[StartElection] id=%d request %d vote failed ...\n", rf.me, server)
+				return
+			} else {
+				//fmt.Printf("[StartElection] %d send vote req succ to %d\n", rf.me, server)
 			}
 
-			// 由于 sendRpc 会阻塞，所以这里选择新启动 goroutine 去 sendRPC，不阻塞当前协程
-			go func(server int) {
-				rf.mu.Lock()
-				//fmt.Printf("[StartElection] id %d role %d term %d send vote req to %d\n", rf.me, rf.currentRole, rf.currentTerm, server)
-				args := RequestVoteArgs{
-					Term:        rf.currentTerm,
-					CandidateId: rf.me,
-				}
-				reply := RequestVoteReply{}
+			rf.mu.Lock()
+			if reply.Term > rf.currentTerm {
+				rf.switchRole(ROLE_Follwer)
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
 				rf.mu.Unlock()
-				ok := rf.sendRequestVote(server, &args, &reply)
-				if !ok {
-					//fmt.Printf("[StartElection] id=%d request %d vote failed ...\n", rf.me, server)
-					return
-				} else {
-					//fmt.Printf("[StartElection] %d send vote req succ to %d\n", rf.me, server)
-				}
+				return
+			}
 
+			if reply.VoteGranted {
+				rf.votedCnt = rf.votedCnt + 1
+			}
+			votedCnt := rf.votedCnt
+			currentRole := rf.currentRole
+			rf.mu.Unlock()
+
+			if votedCnt*2 >= len(rf.peers){
+				// 这里有可能处理 rpc 的时候，收到 rpc，变成了 follower，所以再校验一遍
 				rf.mu.Lock()
-				if reply.Term > rf.currentTerm {
-					rf.switchRole(ROLE_Follwer)
-					rf.currentTerm = reply.Term
-					rf.votedFor = -1
-					rf.mu.Unlock()
-					return
+				if rf.currentRole == ROLE_Candidate {
+					//fmt.Printf("[StartElection] id=%d election succ, votecnt %d \n", rf.me, votedCnt)
+					rf.switchRole(ROLE_Leader)
+					currentRole = rf.currentRole
 				}
-
-				if reply.VoteGranted {
-					rf.votedCnt = rf.votedCnt + 1
-				}
-				votedCnt := rf.votedCnt
-				currentRole := rf.currentRole
 				rf.mu.Unlock()
-
-				if votedCnt*2 >= len(rf.peers){
-					// 这里有可能处理 rpc 的时候，收到 rpc，变成了 follower，所以再校验一遍
-					rf.mu.Lock()
-					if rf.currentRole == ROLE_Candidate {
-						//fmt.Printf("[StartElection] id=%d election succ, votecnt %d \n", rf.me, votedCnt)
-						rf.switchRole(ROLE_Leader)
-						currentRole = rf.currentRole
-					}
-					rf.mu.Unlock()
-					if (currentRole == ROLE_Leader) {
-						rf.SendHeartbeat() // 先主动 send heart beat 一次
-					}
+				if (currentRole == ROLE_Leader) {
+					rf.SendHeartbeat() // 先主动 send heart beat 一次
 				}
-			}(server)
-		}
-	} 
+			}
+		}(server)
+	}
 }
 
 //
@@ -535,8 +531,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.mu.Lock()
 	rf.currentTerm = 1
 	rf.votedFor = -1
+	rf.heartbeatFlag = 0
 	rf.currentRole = ROLE_Follwer
-	rf.electionTimeout = getRandomElectionTimeout()
 	rf.mu.Unlock()
 
 	//fmt.Printf("starting ... %d \n", me)
