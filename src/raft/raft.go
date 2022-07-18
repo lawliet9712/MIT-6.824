@@ -95,6 +95,7 @@ type Raft struct {
 	currentRole     ServerRole
 	heartbeatFlag   int // follwer sleep 期间
 	votedCnt        int
+
 }
 
 // return currentTerm and whether this server
@@ -172,8 +173,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int // candidate's term
-	CandidateId int // candidate global only id
+	Term         int // candidate's term
+	CandidateId  int // candidate global only id
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -273,6 +276,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
+
 	return index, term, isLeader
 }
 
@@ -349,12 +353,18 @@ func (rf *Raft) switchRole(role ServerRole) {
      1. heart beat
 	 2. log replication
 */
-type RequestAppendEntriesArgs struct {
-	Term int
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries[]    int
+	LeaderCommit int
 }
 
-type RequestAppendEntriesReply struct {
-	Term int
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
 }
 
 func (rf *Raft) SwitchRole(role ServerRole) {
@@ -362,7 +372,7 @@ func (rf *Raft) SwitchRole(role ServerRole) {
 	rf.currentRole = role
 }
 
-func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) {
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	/*
 		0. 优先处理
 		如果 args.term > currentTerm ，则直接转为 follwer, 更新当前 currentTerm = args.term
@@ -379,6 +389,9 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.heartbeatFlag = 1
+		reply.Success = false
+	} else {
+		reply.Success = true
 	}
 
 	// 正常情况下，重置 election time out 时间即可
@@ -389,13 +402,14 @@ func (rf *Raft) RequestAppendEntries(args *RequestAppendEntriesArgs, reply *Requ
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.heartbeatFlag = 1
+		reply.Success = true
 	}
 	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
 }
 
-func (rf *Raft) sendRequestAppendEntries(server int, args *RequestAppendEntriesArgs, reply *RequestAppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestAppendEntries", args, reply)
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -405,12 +419,12 @@ func (rf *Raft) SendHeartbeat() {
 			continue
 		}
 		go func(server int) {
-			args := RequestAppendEntriesArgs{}
-			reply := RequestAppendEntriesReply{}
+			args := AppendEntriesArgs{}
+			reply := AppendEntriesReply{}
 			rf.mu.Lock()
 			args.Term = rf.currentTerm
 			rf.mu.Unlock()
-			ok := rf.sendRequestAppendEntries(server, &args, &reply)
+			ok := rf.sendAppendEntries(server, &args, &reply)
 			if (!ok) {
 				//fmt.Printf("[SendHeartbeat] id=%d send heartbeat to %d failed \n", rf.me, server)
 				return
