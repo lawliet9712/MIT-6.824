@@ -28,9 +28,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"bytes"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
+	
 )
 
 func GoID() int {
@@ -127,12 +129,18 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentRole)
+	e.Encode(rf.votedCnt)
+	e.Encode(rf.commitIndex)
+	e.Encode(rf.nextIndex)
+	e.Encode(rf.log)
+	e.Encode(rf.matchIndex)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
