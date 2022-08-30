@@ -161,6 +161,37 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	return true
 }
 
+type InstallSnapshotArgs struct {
+	// Your data here (2A, 2B).
+	Term              int    // Leader's term
+	LeaderId          int    // so follwer can redirect clients
+	LastIncludedIndex int    // the snapshot replaces all entries up through and including this index
+	LastIncludedTerm  int    // Term of lastIncludeIndex
+	Offset            int    // byte offset where chunk is positioned in the snapshot file
+	Data              []byte // raw bytes of the snapshot chunk, starting at offset
+	Done              bool   // true if this is the last chunk
+}
+
+type InstallSnapshotReply struct {
+	Term int // currentTerm, for leader to update itself
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+
+	// 1. Reply immediately if term < currentTerm
+	rf.mu.Lock()
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		rf.mu.Unlock()
+		return
+	}
+}
+
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -397,7 +428,7 @@ func (rf *Raft) SwitchRole(role ServerRole) {
 	case ROLE_Follwer:
 		rf.votedFor = -1
 	case ROLE_Leader:
-		// init leader data
+		// init leader dafta
 		rf.heartbeatTimer.Reset(100 * time.Millisecond)
 		for i := range rf.peers {
 			rf.matchIndex[i] = 0
