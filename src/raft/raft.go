@@ -85,7 +85,7 @@ type Raft struct {
 	votedFor       int
 	currentRole    ServerRole
 	votedCnt       int
-	log            map[int]LogEntry
+	log            []LogEntry
 	commitIndex    int   // index of highest log entry known to be committed (initialized to 0, increases monotonically)
 	lastApplied    int   // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
 	nextIndex      []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
@@ -135,7 +135,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
-	var log map[int]LogEntry
+	var log []LogEntry
 	//var commitIndex int
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
@@ -225,11 +225,6 @@ type RequestVoteReply struct {
 
 var roleName [4]string = [4]string{"None", "Follwer", "Candidate", "Leader"}
 
-func (rf *Raft) to_all_string() string {
-	output := fmt.Sprintf("[%s-%d] Term=%d, VotedFor=%d, Log=%v", roleName[rf.currentRole], rf.me, rf.currentTerm, rf.votedFor, rf.log)
-	return output
-}
-
 func (rf *Raft) to_simple_string() string {
 	output := fmt.Sprintf("[%s-%d] Term=%d, VotedFor=%d", roleName[rf.currentRole], rf.me, rf.currentTerm, rf.votedFor)
 	return output
@@ -261,8 +256,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 2B Leader restriction，拒绝比较旧的投票(优先看任期)
 	// 1. 任期号不同，则任期号大的比较新
 	// 2. 任期号相同，索引值大的（日志较长的）比较新
-	lastLog := rf.log[len(rf.log)]
-	if (args.LastLogIndex < lastLog.Index && args.LastLogTerm == lastLog.Term) || args.LastLogTerm < lastLog.Term {
+	lastLogIndex := len(rf.log) - 1
+	lastLog := rf.log[lastLogIndex]
+	if (args.LastLogIndex < lastLogIndex && args.LastLogTerm == lastLog.Term) || args.LastLogTerm < lastLog.Term {
 		DPrintf("[RequestVote] %v not vaild, %d reject vote request\n", args, rf.me)
 		reply.VoteGranted = false
 		return
@@ -335,11 +331,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	// record in local log
-	index = len(rf.log) + 1
-	rf.log[index] = LogEntry{Term: term, Command: command, Index: index}
+	index = len(rf.log)
+	rf.log = append(rf.log, LogEntry{Term: term, Command: command, Index: index})
 	rf.persist()
 	DPrintf("[Start] %s Add Log Index=%d Term=%d Command=%v\n", rf.to_simple_string(), rf.log[index].Index, rf.log[index].Term, rf.log[index].Command)
-	DPrintf("[Start] Leader current state %s\n", rf.to_all_string())
 	return index, term, isLeader
 }
 
@@ -432,7 +427,7 @@ func (rf *Raft) SwitchRole(role ServerRole) {
 		rf.heartbeatTimer.Reset(100 * time.Millisecond)
 		for i := range rf.peers {
 			rf.matchIndex[i] = 0
-			rf.nextIndex[i] = len(rf.log) + 1
+			rf.nextIndex[i] = len(rf.log)  // 下标从 1 开始的
 		}
 	}
 }
@@ -502,12 +497,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	c. 找到 PrevLog，不冲突，进行下一步同步日志
 	*/
 	// a
-	lastLogIndex := len(rf.log)
+	lastLogIndex := len(rf.log) - 1
 	if lastLogIndex < args.PrevLogIndex {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		// optimistically thinks receiver's log matches with Leader's as a subset
-		reply.ConflictIndex = len(rf.log) + 1
+		reply.ConflictIndex = len(rf.log)
 		// no conflict term
 		reply.ConflictTerm = -1
 		DPrintf("[AppendEntries] %s failed. return because log less than leader expect", rf.to_simple_string())
@@ -541,8 +536,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// compare from rf.log[args.PrevLogIndex + 1]
 	unmatch_idx := -1
 	for i := 0; i < len(args.Entries); i++ {
-		index := args.Entries[i].Index
-		if len(rf.log) < index || rf.log[index].Term != args.Entries[i].Term {
+		index := args.PrevLogIndex + 1 + i // Entries 从 PrevLogIndex + 1 的位置开始
+		if len(rf.log) < index + 1 || rf.log[index].Term != args.Entries[i].Term {
 			unmatch_idx = i
 			break
 		}
@@ -552,27 +547,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// there are unmatch entries
 		// truncate unmatch Follower entries, and apply Leader entries
 		// 1. append leader 的 Entry
-		src_entries := args.Entries[unmatch_idx:]
-		dst_entries := ""
-		for i := unmatch_idx; i < len(args.Entries); i++ {
-			entry, found := rf.log[args.Entries[i].Index]
-			if found {
-				dst_entries += fmt.Sprintf(" %v ", entry)
-			}
-			rf.log[args.Entries[i].Index] = args.Entries[i]
+		append_entries := args.Entries[unmatch_idx:]
+		rf.log = rf.log[:unmatch_idx + args.PrevLogIndex + 1] // 切片到 endIndex - 1 的位置，所以要 +1
+		for _, entry := range append_entries {
+			rf.log = append(rf.log, entry)
 		}
-		DPrintf("[AppendEntries] %s Add Log %v", rf.to_simple_string(), src_entries)
-
-		if dst_entries != "" {
-			DPrintf("[AppendEntries] %s be override log=%s", rf.to_simple_string(), dst_entries)
-		}
+		DPrintf("[AppendEntries] %s Add Log %v", rf.to_simple_string(), append_entries)
 	}
 
 	// 3. 持久化提交
 	if args.LeaderCommit > rf.commitIndex {
 		commitIndex := args.LeaderCommit
-		if commitIndex > len(rf.log) {
-			commitIndex = len(rf.log)
+		if commitIndex > len(rf.log) - 1 {
+			commitIndex = len(rf.log) - 1
 		}
 		rf.setCommitIndex(commitIndex)
 	}
@@ -585,24 +572,24 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 func (rf *Raft) setCommitIndex(commitIndex int) {
-	DPrintf("[setCommitIndex] commitIndex %d, lastApplied %d, %s", commitIndex, rf.lastApplied, rf.to_all_string())
 	rf.commitIndex = commitIndex
 	// apply all entries between lastApplied and committed
 	// should be called after commitIndex updated
-	if rf.commitIndex > rf.lastApplied {
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-			var msg ApplyMsg
-			msg.CommandValid = true
-			msg.Command = rf.log[i].Command
-			msg.CommandIndex = rf.log[i].Index
-			rf.applyCh <- msg
-			// do not forget to update lastApplied index
-			// this is another goroutine, so protect it with lock
-			if rf.lastApplied < msg.CommandIndex {
-				rf.lastApplied = msg.CommandIndex
+	go func() {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if rf.commitIndex > rf.lastApplied {
+			DPrintf("[setCommitIndex] commitIndex %d, lastApplied %d", commitIndex, rf.lastApplied)
+			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+				var msg ApplyMsg
+				msg.CommandValid = true
+				msg.Command = rf.log[i].Command
+				msg.CommandIndex = i // command index require start at 1
+				rf.applyCh <- msg
+				rf.lastApplied = i
 			}
 		}
-	}
+	}()
 }
 
 func (rf *Raft) SendAppendEntries() {
@@ -627,7 +614,7 @@ func (rf *Raft) SendAppendEntries() {
 			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 			// 意味着有日志还没被 commit
 			if len(rf.log) != rf.matchIndex[server] {
-				for i := rf.nextIndex[server]; i <= len(rf.log); i++ { // log 的 index 从 1 开始
+				for i := rf.nextIndex[server]; i < len(rf.log); i++ { // log 的 index 从 1 开始，数组下标从 0 开始，所以 -1
 					args.Entries = append(args.Entries, rf.log[i])
 				}
 			}
@@ -637,7 +624,6 @@ func (rf *Raft) SendAppendEntries() {
 			rf.mu.Unlock()
 			ok := rf.sendAppendEntries(server, &args, &reply)
 			if !ok {
-				////fmt.Printf("[SendAppendEntries] id=%d send heartbeat to %d failed \n", rf.me, server)
 				return
 			}
 
@@ -655,7 +641,7 @@ func (rf *Raft) SendAppendEntries() {
 				return
 			}
 
-			// 如果同步日志失败，则将 nextIndex - 1，下次心跳重试
+			// 如果同步日志失败，fast forward 一下, 从 PrevLogIndex - 1 开始找
 			if !reply.Success {
 				DPrintf("[SendAppendEntries] %s replicate log to %d failed , change nextIndex from %d to %d\n", rf.to_simple_string(), server, rf.nextIndex[server], reply.ConflictIndex)
 				rf.nextIndex[server] = reply.ConflictIndex
@@ -663,7 +649,7 @@ func (rf *Raft) SendAppendEntries() {
 				// if term found, override it to
 				// the first entry after entries in ConflictTerm
 				if reply.ConflictTerm != -1 {
-					for i := args.PrevLogIndex; i >= 1; i-- {
+					for i := args.PrevLogIndex - 1; i >= 1; i-- {
 						if rf.log[i].Term == reply.ConflictTerm {
 							// in next trial, check if log entries in ConflictTerm matches
 							rf.nextIndex[server] = i
@@ -677,7 +663,7 @@ func (rf *Raft) SendAppendEntries() {
 				rf.matchIndex[server] = rf.nextIndex[server] - 1
 				DPrintf("[SendAppendEntries] %s replicate log to %d succ , matchIndex=%v nextIndex=%v\n", rf.to_simple_string(), server, rf.matchIndex, rf.nextIndex)
 				// 2. 检查是否可以提交，检查 rf.commitIndex
-				for N := len(rf.log); N > rf.commitIndex; N-- {
+				for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
 					if rf.log[N].Term != rf.currentTerm {
 						continue
 					}
@@ -723,12 +709,13 @@ func (rf *Raft) StartElection() {
 		// 由于 sendRpc 会阻塞，所以这里选择新启动 goroutine 去 sendRPC，不阻塞当前协程
 		go func(server int) {
 			rf.mu.Lock()
-			lastLog := rf.log[len(rf.log)]
+			lastLogIndex := len(rf.log) - 1
+			lastLog := rf.log[lastLogIndex]
 			args := RequestVoteArgs{
 				Term:         rf.currentTerm,
 				CandidateId:  rf.me,
 				LastLogTerm:  lastLog.Term,
-				LastLogIndex: lastLog.Index,
+				LastLogIndex: lastLogIndex,
 			}
 			reply := RequestVoteReply{}
 			rf.mu.Unlock()
@@ -791,17 +778,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 1
 	rf.votedFor = -1
 	rf.currentRole = ROLE_Follwer
-	rf.lastApplied = 0
-	rf.commitIndex = 0
+	rf.log = make([]LogEntry, 1)
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
-	rf.log = make(map[int]LogEntry)
 	rf.heartbeatTimer = time.NewTimer(100 * time.Millisecond)
 	rf.electionTimer = time.NewTimer(getRandomTimeout())
 	rf.applyCh = applyCh
 	for i := range rf.peers {
 		rf.matchIndex[i] = 0
-		rf.nextIndex[i] = len(rf.log) + 1
+		rf.nextIndex[i] = len(rf.log)
 	}
 
 	rf.mu.Unlock()
