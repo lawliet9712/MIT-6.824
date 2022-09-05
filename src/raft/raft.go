@@ -543,8 +543,13 @@ func (rf *Raft) SwitchRole(role ServerRole) {
 	switch role {
 	case ROLE_Follwer:
 		rf.votedFor = -1
+		rf.heartbeatTimer.Stop()
+		rf.electionTimer.Reset(getRandomTimeout())
+	case ROLE_Candidate:
+		rf.heartbeatTimer.Stop()
 	case ROLE_Leader:
-		// init leader dafta
+		// init leader data
+		rf.electionTimer.Stop()
 		rf.heartbeatTimer.Reset(100 * time.Millisecond)
 		for i := range rf.peers {
 			rf.matchIndex[i] = -1
@@ -715,9 +720,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		append_entries := args.Entries[unmatch_idx:]
 		rf.sliceLog(0, unmatch_idx + rf.logicIndexToRealIndex(args.PrevLogIndex) + 1)
 		// rf.log = rf.log[:unmatch_idx + rf.logicIndexToRealIndex(args.PrevLogIndex) + 1] // 切片到 endIndex - 1 的位置，所以要 +1
-		for _, entry := range append_entries {
-			rf.log = append(rf.log, entry)
-		}
+		rf.log = append(rf.log, args.Entries[unmatch_idx:]...)
 		DPrintf("[AppendEntries] %s Add Log %v", rf.role_info(), append_entries)
 	}
 
