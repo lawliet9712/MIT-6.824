@@ -717,10 +717,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// there are unmatch entries
 		// truncate unmatch Follower entries, and apply Leader entries
 		// 1. append leader 的 Entry
-		append_entries := args.Entries[unmatch_idx:]
+		append_entries := make([]LogEntry, len(args.Entries) - unmatch_idx)
+		copy(append_entries, args.Entries[unmatch_idx:]) // 防止 race，因为切片还是引用
 		rf.sliceLog(0, unmatch_idx + rf.logicIndexToRealIndex(args.PrevLogIndex) + 1)
 		// rf.log = rf.log[:unmatch_idx + rf.logicIndexToRealIndex(args.PrevLogIndex) + 1] // 切片到 endIndex - 1 的位置，所以要 +1
-		rf.log = append(rf.log, args.Entries[unmatch_idx:]...)
+		rf.log = append(rf.log, append_entries...)
 		DPrintf("[AppendEntries] %s Add Log %v", rf.role_info(), append_entries)
 	}
 
@@ -808,7 +809,9 @@ func (rf *Raft) SendAppendEntries() {
 					startIdx := rf.logicIndexToRealIndex(rf.nextIndex[server])
 					DPrintf("[SendAppendEntries] %s to %d startIdx=%d, log=%v, snapshotIndex=%d", rf.role_info(), server, startIdx, rf.log, rf.snapshot.lastIncludedIndex)
 					if startIdx < rf.getLogRealSize() {
-						args.Entries = rf.log[startIdx:]
+						args.Entries = make([]LogEntry, len(rf.log) - startIdx)
+						copy(args.Entries, rf.log[startIdx:]) // 防止 race，因为切片还是引用
+						//args.Entries = rf.log[startIdx:] 不能直接切片，会 data race
 					}
 				}
 			}
