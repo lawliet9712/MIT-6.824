@@ -59,6 +59,7 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+	DPrintf("%d Received Kill Command", kv.me)
 }
 
 func (kv *KVServer) killed() bool {
