@@ -23,6 +23,9 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key     string
+	Value   string
+	Command string
 }
 
 type KVServer struct {
@@ -35,17 +38,79 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	dataSource map[string]string
+}
+
+func (kv *KVServer) Start(args Op) Op {
+	kv.rf.Start(args)
+	applyMsg := <-kv.applyCh
+	return applyMsg.Command.(Op)
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	// step 0 : check kv is leader
+	_, IsLeader := kv.rf.GetState()
+	if !IsLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// step 1 : start a command, wait raft to commit command
+	Command := kv.Start(Op{
+		Key:     args.Key,
+		Command: "Get",
+	})
+
+	// step 2 : parse op struct
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	reply.Err = OK
+	_, found := kv.dataSource[Command.Key]
+	if !found {
+		reply.Err = ErrNoKey
+		return
+	} else {
+		reply.Value = kv.dataSource[Command.Key]
+		DPrintf("[KVServer-%d] Get %s is %s", kv.me, Command.Key, reply.Value)
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	// step 0 : check kv is leader
+	_, IsLeader := kv.rf.GetState()
+	if !IsLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// step 1 : start a command, wait raft to commit command
+	Command := kv.Start(Op{
+		Key:     args.Key,
+		Value:   args.Value,
+		Command: args.Op,
+	})
+
+	// step 2 : parse op struct
+	reply.Err = OK
+	if Command.Command == "Put" {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		_, found := kv.dataSource[Command.Key]
+		if !found {
+			reply.Err = ErrNoKey
+			return
+		} else {
+			kv.dataSource[Command.Key] = Command.Value
+			DPrintf("[KVServer-%d] Put %s to %s", kv.me, Command.Key, Command.Value)
+		}
+	} else if Command.Command == "Append" {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		kv.dataSource[Command.Key] += Command.Value
+		DPrintf("[KVServer-%d] Append %s to %s", kv.me, Command.Key, Command.Value)
+	}
 }
 
-//
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
@@ -54,7 +119,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // code to Kill(). you're not required to do anything
 // about this, but it may be convenient (for example)
 // to suppress debug output from a Kill()ed instance.
-//
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
@@ -67,7 +131,6 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-//
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -80,7 +143,6 @@ func (kv *KVServer) killed() bool {
 // you don't need to snapshot.
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
-//
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
@@ -96,6 +158,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-
+	kv.dataSource = make(map[string]string)
 	return kv
 }

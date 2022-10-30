@@ -8,6 +8,11 @@ const (
 
 type Err string
 
+// prevent dup request
+type SeqArgs struct {
+	SeqId int
+}
+
 // Put or Append
 type PutAppendArgs struct {
 	Key   string

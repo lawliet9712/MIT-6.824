@@ -1,13 +1,16 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
 
+	"6.824/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	leaderId int
 }
 
 func nrand() int64 {
@@ -24,7 +27,6 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
-//
 // fetch the current value for a key.
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
@@ -35,22 +37,32 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
 	args := GetArgs{
-		Key : key,
+		Key: key,
 	}
 	reply := GetReply{}
-	ok := ck.SendGet(1, &args, &reply)
-	if ok {
-		DPrintf("get result = %v", reply)
+	server := ck.leaderId
+	for {
+		ok := ck.SendGet(server%len(ck.servers), &args, &reply)
+		if ok {
+			if reply.Err == ErrWrongLeader {
+				server += 1
+				continue
+			}
+			ck.leaderId = server
+			DPrintf("[Get] get result = %v", reply)
+			break
+		} else {
+			server += 1
+		}
 	}
+
 	return reply.Value
 }
 
-//
 // shared by Put and Append.
 //
 // you can send an RPC with code like this:
@@ -59,28 +71,43 @@ func (ck *Clerk) Get(key string) string {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-//
+// OK             = "OK"
+// ErrNoKey       = "ErrNoKey"
+// ErrWrongLeader = "ErrWrongLeader"
+
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	args := PutAppendArgs{
-		Key : key,
-		Value : value,
-		Op : op,
+		Key:   key,
+		Value: value,
+		Op:    op,
 	}
 	reply := PutAppendReply{}
-	ok := ck.SendPutAppend(1, &args, &reply)
-	if ok {
-
+	server := ck.leaderId
+	for {
+		ok := ck.SendPutAppend(server%len(ck.servers), &args, &reply)
+		if ok {
+			if reply.Err == ErrWrongLeader {
+				server += 1
+				continue
+			}
+			ck.leaderId = server
+			DPrintf("[PutAppend] finish ... reply = %v", reply)
+			break
+		} else {
+			// Send Request failed ... retry
+			server += 1
+		}
 	}
 }
 
 func (ck *Clerk) SendGet(server int, args *GetArgs, reply *GetReply) bool {
-	ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
+	ok := ck.servers[server].Call("KVServer.Get", args, reply)
 	return ok
 }
 
 func (ck *Clerk) SendPutAppend(server int, args *PutAppendArgs, reply *PutAppendReply) bool {
-	ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
+	ok := ck.servers[server].Call("KVServer.PutAppend", args, reply)
 	return ok
 }
 
