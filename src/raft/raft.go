@@ -454,6 +454,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// record in local log
 	index = len(rf.log)
 	rf.log = append(rf.log, LogEntry{Term: term, Command: command})
+	rf.SendAppendEntries() // for lab3a TestSpeed
+	rf.heartbeatTimer.Reset(100 * time.Millisecond)
 	rf.persist()
 	DPrintf("[Start] %s Add Log Index=%d Term=%d Command=%v\n", rf.role_info(), rf.getLogLogicSize(), rf.log[index].Term, rf.log[index].Command)
 	return rf.getLogLogicSize(), term, isLeader
@@ -758,6 +760,9 @@ func (rf *Raft) setCommitIndex(commitIndex int) {
 		// apply all entries between lastApplied and committed
 		// should be called after commitIndex updated
 		go func(commandBaseIndex int, applyEntry []LogEntry) {
+			rf.mu.Lock()
+			DPrintf("[setCommitIndex] %s commit LogEntry %v ", rf.role_info(), applyEntry)
+			rf.mu.Unlock()
 				for index, entry := range applyEntry {
 					var msg ApplyMsg
 					msg.CommandValid = true
@@ -770,11 +775,11 @@ func (rf *Raft) setCommitIndex(commitIndex int) {
 					DPrintf("[setCommitIndex] %d commit msg %v", rf.me, msg)
 				}
 		}(rf.lastApplied + 1, rf.log[lastApplied + 1 : commitIndex + 1])
-		
 	}
 }
 
 func (rf *Raft) SendAppendEntries() {
+	alreadyCommit := false
 	for server := range rf.peers {
 		if server == rf.me {
 			continue
@@ -872,13 +877,13 @@ func (rf *Raft) SendAppendEntries() {
 					}
 					//fmt.Printf("%d matchCnt=%d\n", rf.me, matchCnt)
 					// a. 票数 > 1/2 则能够提交
-					if matchCnt*2 > len(rf.matchIndex) {
+					if matchCnt*2 > len(rf.matchIndex) && !alreadyCommit {
+						alreadyCommit = true
 						rf.setCommitIndex(rf.realIndexToLogicIndex(N))
 						break
 					}
 				}
 			}
-
 		}(server)
 	}
 }

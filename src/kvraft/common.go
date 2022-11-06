@@ -10,7 +10,8 @@ type Err string
 
 // prevent dup request
 type SeqArgs struct {
-	SeqId int
+	SeqId int // clerk seq id
+	CkId int64 // clerk id
 }
 
 // Put or Append
@@ -21,6 +22,8 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClerkId int64
+	SeqId int
 }
 
 type PutAppendReply struct {
@@ -30,6 +33,8 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	ClerkId int64
+	SeqId int
 }
 
 type GetReply struct {

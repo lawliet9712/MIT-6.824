@@ -1,9 +1,9 @@
 package kvraft
 
 import (
+	"time"
 	"crypto/rand"
 	"math/big"
-
 	"6.824/labrpc"
 )
 
@@ -11,6 +11,10 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	leaderId int
+	// clerk unique id
+	ckId int64
+	// request seq id
+	seqId int
 }
 
 func nrand() int64 {
@@ -24,6 +28,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.ckId = nrand()
+	ck.seqId = -1
 	return ck
 }
 
@@ -38,11 +44,14 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
 	args := GetArgs{
 		Key: key,
+		ClerkId : ck.ckId,
+		SeqId : ck.allocSeqId(),
 	}
+	
+	DPrintf("[Clerk-%d] call Get key=%s , SeqId=%d",  ck.ckId, key, args.SeqId)
 	reply := GetReply{}
 	server := ck.leaderId
 	for {
@@ -50,17 +59,24 @@ func (ck *Clerk) Get(key string) string {
 		if ok {
 			if reply.Err == ErrWrongLeader {
 				server += 1
+				DPrintf("[Get] %d ErrWrongLeader, retry = %d, args=%v", ck.ckId, server, args)
 				continue
 			}
 			ck.leaderId = server
-			DPrintf("[Get] get result = %v", reply)
+			DPrintf("[Get] %d get result = %v", ck.ckId, reply)
 			break
 		} else {
 			server += 1
 		}
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	return reply.Value
+}
+
+func (ck *Clerk) allocSeqId() int {
+	ck.seqId += 1
+	return ck.seqId
 }
 
 // shared by Put and Append.
@@ -81,23 +97,29 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Key:   key,
 		Value: value,
 		Op:    op,
+		ClerkId : ck.ckId,
+		SeqId : ck.allocSeqId(),
 	}
 	reply := PutAppendReply{}
+	DPrintf("[Clerk-%d] call PutAppend key=%s value=%s op=%s, seq=%d", ck.ckId, key, value, op, args.SeqId)
 	server := ck.leaderId
 	for {
 		ok := ck.SendPutAppend(server%len(ck.servers), &args, &reply)
 		if ok {
 			if reply.Err == ErrWrongLeader {
 				server += 1
+				DPrintf("[Clerk][PutAppend] %d faild, try next server id =%d ... retry args=%v", ck.ckId, server, args)
 				continue
 			}
 			ck.leaderId = server
-			DPrintf("[PutAppend] finish ... reply = %v", reply)
+			DPrintf("[Clerk][PutAppend] %d finish server=%d, ... reply = %v", ck.ckId, server, reply)
 			break
 		} else {
 			// Send Request failed ... retry
 			server += 1
+			DPrintf("[Clerk][PutAppend] %d faild, call result=false, try next server id =%d ... retry reply=%v", ck.ckId, server, reply)
 		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
