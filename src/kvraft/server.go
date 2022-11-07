@@ -35,7 +35,6 @@ type Op struct {
 
 type ClerkOps struct {
 	SeqId int // clerk current seq id
-	Ops   map[int]Op // Seqid to command
 	getCh    chan Op
 	putAppendCh chan Op
 	Timestamp int64
@@ -82,7 +81,6 @@ func (kv *KVServer) GetCk(ckId int64) *ClerkOps {
 	if !found {
 		ck = new(ClerkOps)
 		ck.SeqId = 0
-		ck.Ops = make(map[int]Op)
 		ck.getCh = make(chan Op)
 		ck.putAppendCh = make(chan Op)
 		kv.messageMap[ckId] = ck
@@ -119,6 +117,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Unlock()
 	// start a command
 	Timestamp := time.Now().UnixNano()
+	kv.SetCkTimestamp(ck, Timestamp)
 	_, _, isLeader := kv.rf.Start(Op{
 		Key:     args.Key,
 		Command: "Get",
@@ -132,7 +131,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	kv.SetCkTimestamp(ck, Timestamp)
 	DPrintf("[KVServer-%d] Received Req Get %v", kv.me, args)
 	// step 2 : parse op struct
 	getMsg, err := kv.WaitApplyMsgByCh(ck.getCh, ck)
@@ -171,6 +169,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Unlock()
 	// start a command
 	Timestamp := time.Now().UnixNano()
+	kv.SetCkTimestamp(ck, Timestamp)
 	_, _, isLeader := kv.rf.Start(Op{
 		Key:     args.Key,
 		Value:   args.Value,
@@ -185,7 +184,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	kv.SetCkTimestamp(ck, Timestamp)
 	DPrintf("[KVServer-%d] Received Req PutAppend %v, SeqId=%d", kv.me, args, args.SeqId)
 	// step 2 : wait the channel
 	reply.Err = OK
@@ -222,17 +220,12 @@ func (kv *KVServer) SortMsg() {
 		}
 		
 		// cache msg, because we lost the middle request
-		if Msg.SeqId > ck.SeqId {
-			ck.Ops[Msg.SeqId] = Msg
-			DPrintf("[KVServer-%d] Get new Msg %v, SeqId=%d, wait", kv.me, Msg, ck.SeqId)
-			continue
-		}
 		
 		// process msg
 		kv.mu.Lock()
 		needNotify := ck.Timestamp == Msg.Timestamp
 		if Msg.Server == kv.me && isLeader && needNotify {
-			// notify channel
+			// notify channel and reset timestamp
 			ck.Timestamp = 0
 			kv.mu.Unlock()
 			DPrintf("[KVServer-%d] Process Msg %v finish, ready send to ck.Ch, SeqId=%d isLeader=%v", kv.me, Msg, ck.SeqId, isLeader)
@@ -260,20 +253,6 @@ func (kv *KVServer) SortMsg() {
 			kv.dataSource[Msg.Key] += Msg.Value
 		}
 		kv.mu.Unlock()
-
-		// search next msg
-		for i := ck.SeqId; i <= len(ck.Ops); i++{
-			nextMsg, found := ck.Ops[i]
-			if found {
-				DPrintf("[KV-Server-%d] found next Msg %v", kv.me, nextMsg)
-				kv.mu.Lock()
-				ck.SeqId += 1
-				kv.mu.Unlock()
-				ch <- nextMsg
-			} else {
-				break
-			}
-		}
 	}
 }
 

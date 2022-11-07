@@ -760,9 +760,6 @@ func (rf *Raft) setCommitIndex(commitIndex int) {
 		// apply all entries between lastApplied and committed
 		// should be called after commitIndex updated
 		go func(commandBaseIndex int, applyEntry []LogEntry) {
-			rf.mu.Lock()
-			DPrintf("[setCommitIndex] %s commit LogEntry %v ", rf.role_info(), applyEntry)
-			rf.mu.Unlock()
 				for index, entry := range applyEntry {
 					var msg ApplyMsg
 					msg.CommandValid = true
