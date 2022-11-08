@@ -30,14 +30,27 @@ type Op struct {
 	ClerkId int64
 	SeqId int
 	Server int
-	Timestamp int64
+	MsgUniqueId int64 // Msg unique id, for rpc reply
 }
 
 type ClerkOps struct {
-	SeqId int // clerk current seq id
+	seqId int // clerk current seq id
 	getCh    chan Op
 	putAppendCh chan Op
-	Timestamp int64
+	msgUniqueId int64
+	mu *sync.Mutex
+}
+
+func (ck *ClerkOps) setMsgUniqueId(uid int64) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	ck.msgUniqueId = uid
+}
+
+func (ck *ClerkOps) getMsgUniqueId() int64 {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	return ck.msgUniqueId
 }
 
 type KVServer struct {
@@ -66,7 +79,7 @@ func (kv *KVServer) WaitApplyMsgByCh (ch chan Op, ck *ClerkOps) (Op, Err) {
 		case <- timer.C:
 			curTerm, isLeader := kv.rf.GetState()
 			if curTerm != startTerm || !isLeader {
-				kv.SetCkTimestamp(ck, 0)
+				ck.setMsgUniqueId(0)
 				return Op{}, ErrWrongLeader
 			}
 			timer.Reset(1000 * time.Millisecond)
@@ -80,19 +93,18 @@ func (kv *KVServer) GetCk(ckId int64) *ClerkOps {
 	ck, found :=  kv.messageMap[ckId]
 	if !found {
 		ck = new(ClerkOps)
-		ck.SeqId = 0
+		ck.seqId = 0
 		ck.getCh = make(chan Op)
 		ck.putAppendCh = make(chan Op)
+		ck.mu = &kv.mu
 		kv.messageMap[ckId] = ck
 		DPrintf("[KVServer-%d] Init ck %d getCh=%v, putAppendCh=%v", kv.me ,ckId, ck.getCh, ck.putAppendCh)
 	}
 	return kv.messageMap[ckId]
 }
 
-func (kv *KVServer) SetCkTimestamp(ck *ClerkOps, ts int64) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	ck.Timestamp = ts
+func (kv *KVServer) GenMsgUniqueId() int64 {
+	return time.Now().UnixNano()
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -103,7 +115,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// check msg 
 	kv.mu.Lock()
 	// already process
-	if ck.SeqId > args.SeqId {
+	if ck.seqId > args.SeqId {
 		reply.Err = OK
 		_, foundData := kv.dataSource[args.Key]
 		if !foundData {
@@ -115,16 +127,17 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	kv.mu.Unlock()
+
 	// start a command
-	Timestamp := time.Now().UnixNano()
-	kv.SetCkTimestamp(ck, Timestamp)
+	msgUniqueId := kv.GenMsgUniqueId() 
+	ck.setMsgUniqueId(msgUniqueId)
 	_, _, isLeader := kv.rf.Start(Op{
 		Key:     args.Key,
 		Command: "Get",
 		ClerkId : args.ClerkId,
 		SeqId : args.SeqId,
 		Server : kv.me,
-		Timestamp : Timestamp,
+		MsgUniqueId : msgUniqueId,
 	})
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -161,15 +174,16 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// check msg 
 	kv.mu.Lock()
 	// already process
-	if ck.SeqId > args.SeqId {
+	if ck.seqId > args.SeqId {
 		kv.mu.Unlock()
 		reply.Err = OK
 		return
 	}
 	kv.mu.Unlock()
+	
 	// start a command
-	Timestamp := time.Now().UnixNano()
-	kv.SetCkTimestamp(ck, Timestamp)
+	msgUniqueId := kv.GenMsgUniqueId()
+	ck.setMsgUniqueId(msgUniqueId)
 	_, _, isLeader := kv.rf.Start(Op{
 		Key:     args.Key,
 		Value:   args.Value,
@@ -177,7 +191,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClerkId : args.ClerkId,
 		SeqId : args.SeqId,
 		Server : kv.me,
-		Timestamp : Timestamp,
+		MsgUniqueId : msgUniqueId,
 	})
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -198,9 +212,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *KVServer) SortMsg() {
 	for {
-		kv.mu.Lock()
-		kv.safeTimestamp = time.Now().UnixNano()
-		kv.mu.Unlock()
+		//kv.mu.Lock()
+		//kv.safeTimestamp = time.Now().UnixNano()
+		//kv.mu.Unlock()
 		applyMsg := <-kv.applyCh
 		Msg := applyMsg.Command.(Op)
 		DPrintf("[KVServer-%d] Received Msg from channel. Msg=%v", kv.me, Msg)
@@ -220,30 +234,25 @@ func (kv *KVServer) SortMsg() {
 		}
 		
 		// cache msg, because we lost the middle request
-		
 		// process msg
-		kv.mu.Lock()
-		needNotify := ck.Timestamp == Msg.Timestamp
+		needNotify := ck.getMsgUniqueId() == Msg.MsgUniqueId
 		if Msg.Server == kv.me && isLeader && needNotify {
 			// notify channel and reset timestamp
-			ck.Timestamp = 0
-			kv.mu.Unlock()
-			DPrintf("[KVServer-%d] Process Msg %v finish, ready send to ck.Ch, SeqId=%d isLeader=%v", kv.me, Msg, ck.SeqId, isLeader)
+			ck.setMsgUniqueId(0)
+			DPrintf("[KVServer-%d] Process Msg %v finish, ready send to ck.Ch, SeqId=%d isLeader=%v", kv.me, Msg, ck.seqId, isLeader)
 			ch <- Msg
-			DPrintf("[KVServer-%d] Process Msg %v Send to Rpc handler finish SeqId=%d isLeader=%v", kv.me, Msg, ck.SeqId, isLeader)
-		} else {
-			kv.mu.Unlock()
+			DPrintf("[KVServer-%d] Process Msg %v Send to Rpc handler finish SeqId=%d isLeader=%v", kv.me, Msg, ck.seqId, isLeader)
 		}
 
 		// already process this request, so ignore
-		if Msg.SeqId < ck.SeqId {
-			DPrintf("[KVServer-%d] Get old Msg %v, SeqId=%d, continue", kv.me, Msg, ck.SeqId)
+		if Msg.SeqId < ck.seqId {
+			DPrintf("[KVServer-%d] Get old Msg %v, SeqId=%d, continue", kv.me, Msg, ck.seqId)
 			continue
 		} 
 
 		// do logic
 		kv.mu.Lock()
-		ck.SeqId = Msg.SeqId + 1
+		ck.seqId = Msg.SeqId + 1
 		switch Msg.Command {
 		case "Put":
 			kv.dataSource[Msg.Key] = Msg.Value
@@ -285,7 +294,7 @@ func (kv *KVServer) healthCheck() {
 		_, leader := kv.rf.GetState()
 		output := fmt.Sprintf("consume time out , isleader=%v", leader)
 		kv.mu.Lock()
-		if (currentTs - kv.safeTimestamp) > (int64)(60000 * time.Millisecond) {
+		if (currentTs - kv.safeTimestamp) > (int64)(6000 * time.Millisecond) {
 			panic(output)
 		}
 		kv.mu.Unlock()
