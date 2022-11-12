@@ -116,6 +116,21 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
+func (rf *Raft) GetRaftState() []byte {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	//e.Encode(rf.commitIndex)
+	e.Encode(rf.log)
+	e.Encode(rf.snapshot.lastIncludedIndex)
+	e.Encode(rf.snapshot.lastIncludedTerm)
+
+	return w.Bytes()
+}
+
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	w := new(bytes.Buffer)
@@ -162,6 +177,10 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.commitIndex = snapshot.lastIncludedIndex - 1
 		DPrintf("[readPersist] Term=%d VotedFor=%d, Log=%v ...", rf.currentTerm, rf.votedFor, rf.log)
 	}
+}
+
+func (rf *Raft) ReadPersist(data []byte) {
+	rf.readPersist(data)
 }
 
 //

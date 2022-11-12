@@ -6,12 +6,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"bytes"
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -63,6 +64,7 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister *raft.Persister
 	dataSource map[string]string
 	messageMap map[int64]*ClerkOps // clerk id to ClerkOps struct
 	// safe timestamp
@@ -156,6 +158,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
+	kv.SaveState()
 	_, foundData := kv.dataSource[getMsg.Key]
 	if !foundData {
 		reply.Err = ErrNoKey
@@ -202,6 +205,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// step 2 : wait the channel
 	reply.Err = OK
 	Msg, err := kv.WaitApplyMsgByCh(ck.putAppendCh, ck)
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.SaveState()
 	DPrintf("[KVServer-%d] Received Msg [PutAppend] from ck.putAppendCh args=%v, SeqId=%d, Msg=%v", kv.me, args, args.SeqId, Msg)
 	reply.Err = err
 	if err != OK {
@@ -256,10 +262,12 @@ func (kv *KVServer) SortMsg() {
 		switch Msg.Command {
 		case "Put":
 			kv.dataSource[Msg.Key] = Msg.Value
+			kv.SaveState()
 			DPrintf("[KVServer-%d] Excute Put key=%s value=%s", kv.me, Msg.Key, Msg.Value)
 		case "Append":
 			DPrintf("[KVServer-%d] Excute Append key=%s value=%s", kv.me, Msg.Key, Msg.Value)
 			kv.dataSource[Msg.Key] += Msg.Value
+			kv.SaveState()
 		}
 		kv.mu.Unlock()
 	}
@@ -301,6 +309,53 @@ func (kv *KVServer) healthCheck() {
 	}
 }
 
+// save kv state and raft snapshot
+func (kv *KVServer) SaveState() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	messageMap := make(map[int64]ClerkOps)
+	for ckId, ck := range kv.messageMap {
+		messageMap[ckId] = *ck
+	}
+	e.Encode(messageMap)
+	e.Encode(kv.dataSource)
+
+	kvstate := w.Bytes()
+	kv.persister.SaveStateAndSnapshot(kvstate, kv.rf.GetRaftState())
+}
+
+func (kv *KVServer) readKVState(data []byte) {
+	// Your code here (2C).
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	messageMap := make(map[int64]ClerkOps)
+	dataSource := make(map[string]string)
+	//var commitIndex int
+	if d.Decode(&messageMap) != nil ||
+		d.Decode(&dataSource) != nil {
+		DPrintf("[readKVState] decode failed ...")
+	} else {
+		for ckId, ck := range messageMap {
+			kv.messageMap[ckId] = &ck
+		}
+		kv.dataSource = dataSource
+		DPrintf("[readKVState] messageMap=%v dataSource=%v" , messageMap, dataSource)
+	}
+}
+
+func (kv *KVServer) readRaftState(data []byte) {
+	kv.rf.ReadPersist(data)
+}
+
+// read kv state and raft snapshot
+func (kv *KVServer) readState() {
+	kv.readKVState(kv.persister.ReadRaftState())
+	kv.readRaftState(kv.persister.ReadSnapshot())
+}
+
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -331,6 +386,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.dataSource = make(map[string]string)
 	kv.messageMap = make(map[int64]*ClerkOps)
+	kv.persister = persister
+	kv.readState()
 	go kv.SortMsg()
 	//go kv.healthCheck()
 	return kv
