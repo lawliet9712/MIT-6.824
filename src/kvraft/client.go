@@ -1,9 +1,10 @@
 package kvraft
 
 import (
-	"time"
 	"crypto/rand"
 	"math/big"
+	"time"
+
 	"6.824/labrpc"
 )
 
@@ -46,12 +47,12 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	args := GetArgs{
-		Key: key,
-		ClerkId : ck.ckId,
-		SeqId : ck.allocSeqId(),
+		Key:     key,
+		ClerkId: ck.ckId,
+		SeqId:   ck.allocSeqId(),
 	}
-	
-	DPrintf("[Clerk-%d] call Get key=%s , SeqId=%d",  ck.ckId, key, args.SeqId)
+
+	DPrintf("[Clerk-%d] call Get key=%s , SeqId=%d", ck.ckId, key, args.SeqId)
 	reply := GetReply{}
 	server := ck.leaderId
 	for {
@@ -94,11 +95,11 @@ func (ck *Clerk) allocSeqId() int {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	args := PutAppendArgs{
-		Key:   key,
-		Value: value,
-		Op:    op,
-		ClerkId : ck.ckId,
-		SeqId : ck.allocSeqId(),
+		Key:     key,
+		Value:   value,
+		Op:      op,
+		ClerkId: ck.ckId,
+		SeqId:   ck.allocSeqId(),
 	}
 	reply := PutAppendReply{}
 	DPrintf("[Clerk-%d] call PutAppend key=%s value=%s op=%s, seq=%d", ck.ckId, key, value, op, args.SeqId)
@@ -108,6 +109,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		if ok {
 			if reply.Err == ErrWrongLeader {
 				server += 1
+				time.Sleep(50 * time.Millisecond)
 				DPrintf("[Clerk][PutAppend] %d faild, try next server id =%d ... retry args=%v", ck.ckId, server, args)
 				continue
 			}
