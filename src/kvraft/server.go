@@ -320,6 +320,15 @@ func (kv *KVServer) SortMsg() {
 				if newMsg.SeqId == ck.seqId {
 					// check notify
 					_, isLeader := kv.rf.GetState()
+					if ck.msgUniqueId != 0 && ck.msgUniqueId != newMsg.MsgUniqueId {
+						DPrintf("[KVServer-%d] msg=%v uid not match, ignore, ck.msgUniqueId=%d", kv.me, newMsg, ck.msgUniqueId)
+						if isLeader {
+							sliceIndex = index
+							continue
+						} else {
+							ck.msgUniqueId = 0
+						}
+					}
 					// check need notify or not
 					needNotify := ck.msgUniqueId == Msg.MsgUniqueId
 					if Msg.Server == kv.me && isLeader && needNotify {
