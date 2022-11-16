@@ -52,19 +52,19 @@ func (ck *Clerk) Get(key string) string {
 		SeqId:   ck.allocSeqId(),
 	}
 
-	DPrintf("[Clerk-%d] call Get key=%s , SeqId=%d", ck.ckId, key, args.SeqId)
 	reply := GetReply{}
 	server := ck.leaderId
 	for {
+		DPrintf("[Clerk-%d] call [Get] request key=%s , SeqId=%d, server=%d", ck.ckId, key, args.SeqId, server%len(ck.servers))
 		ok := ck.SendGet(server%len(ck.servers), &args, &reply)
 		if ok {
 			if reply.Err == ErrWrongLeader {
 				server += 1
-				DPrintf("[Get] %d ErrWrongLeader, retry = %d, args=%v", ck.ckId, server, args)
+				DPrintf("[Clerk-%d] ErrWrongLeader, retry server=%d, args=%v", ck.ckId, server%len(ck.servers), args)
 				continue
 			}
 			ck.leaderId = server
-			DPrintf("[Get] %d get result = %v", ck.ckId, reply)
+			DPrintf("[Clerk-%d] call [Get] response server=%d reply=%v, args=%v", ck.ckId, server%len(ck.servers), reply, args)
 			break
 		} else {
 			server += 1
@@ -102,19 +102,19 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		SeqId:   ck.allocSeqId(),
 	}
 	reply := PutAppendReply{}
-	DPrintf("[Clerk-%d] call PutAppend key=%s value=%s op=%s, seq=%d", ck.ckId, key, value, op, args.SeqId)
 	server := ck.leaderId
 	for {
+		DPrintf("[Clerk-%d] call [PutAppend] request key=%s value=%s op=%s, seq=%d, server=%d", ck.ckId, key, value, op, args.SeqId, server%len(ck.servers))
 		ok := ck.SendPutAppend(server%len(ck.servers), &args, &reply)
 		if ok {
 			if reply.Err == ErrWrongLeader {
 				server += 1
 				time.Sleep(50 * time.Millisecond)
-				DPrintf("[Clerk][PutAppend] %d faild, try next server id =%d ... retry args=%v", ck.ckId, server, args)
+				DPrintf("[Clerk-%d] call [PutAppend] faild, try next server id =%d ... retry args=%v", ck.ckId, server, args)
 				continue
 			}
 			ck.leaderId = server
-			DPrintf("[Clerk][PutAppend] %d finish server=%d, ... reply = %v", ck.ckId, server, reply)
+			DPrintf("[Clerk-%d] call [PutAppend] response server=%d, ... reply = %v, args=%v", ck.ckId, server%len(ck.servers), reply, args)
 			break
 		} else {
 			// Send Request failed ... retry

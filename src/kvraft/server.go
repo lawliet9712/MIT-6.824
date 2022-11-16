@@ -233,7 +233,7 @@ func (kv *KVServer) ProcessMsg() {
 		applyMsg := <-kv.messageCh
 		if applyMsg.SnapshotValid {
 			kv.readKVState(applyMsg.Snapshot)
-			return
+			continue
 		}
 		Msg := applyMsg.Command.(Op)
 		DPrintf("[KVServer-%d] Received Msg from channel. Msg=%v", kv.me, Msg)
@@ -241,7 +241,7 @@ func (kv *KVServer) ProcessMsg() {
 
 		// check need snapshot or not
 		_, isLeader := kv.rf.GetState()
-		if kv.persister.RaftStateSize()/8 >= kv.maxraftstate && kv.maxraftstate != -1 && isLeader {
+		if kv.persister.RaftStateSize()/4 >= kv.maxraftstate && kv.maxraftstate != -1 {
 			DPrintf("[KVServer-%d] size=%d, maxsize=%d, DoSnapshot %v", kv.me, kv.persister.RaftStateSize(), kv.maxraftstate, applyMsg)
 			kv.saveKVState(applyMsg.CommandIndex - 1)
 		}
@@ -349,16 +349,18 @@ func (kv *KVServer) readKVState(data []byte) {
 			ck := kv.GetCk(ckId)
 			kv.mu.Lock()
 			ck.seqId = seqId
-			kv.dataSource = dataSource
 			kv.mu.Unlock()
 		}
 		kv.mu.Lock()
+		kv.dataSource = dataSource
 		DPrintf("[KVServer-%d] readKVState messageMap=%v dataSource=%v", kv.me, kv.messageMap, kv.dataSource)
 		kv.mu.Unlock()
 	}
 }
 
 func (kv *KVServer) saveKVState(index int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	cks := make(map[int64]int)
@@ -400,14 +402,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.applyCh = make(chan raft.ApplyMsg, 1000) // for test3A TestSpeed
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
+	kv.mu.Lock()
 	DPrintf("Start KVServer-%d", me)
 	// You may need initialization code here.
 	kv.dataSource = make(map[string]string)
 	kv.messageMap = make(map[int64]*ClerkOps)
 	kv.messageCh = make(chan raft.ApplyMsg, 1000)
 	kv.persister = persister
-	//kv.readState()
+	kv.mu.Unlock()
+	kv.readState()
 	go kv.SortMsg()
 	go kv.ProcessMsg()
 	//go kv.healthCheck()
