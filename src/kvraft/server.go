@@ -370,7 +370,7 @@ func (kv *KVServer) saveKVState(index int) {
 	e.Encode(cks)
 	e.Encode(kv.dataSource)
 	kv.rf.Snapshot(index, w.Bytes())
-	DPrintf("[KVServer-%d] Size=%d, log=%v", kv.me, kv.persister.RaftStateSize(), kv.rf.GetLog())
+	DPrintf("[KVServer-%d] Size=%d", kv.me, kv.persister.RaftStateSize())
 }
 
 // read kv state and raft snapshot
