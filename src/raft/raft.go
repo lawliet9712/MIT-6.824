@@ -197,6 +197,8 @@ type InstallSnapshotArgs struct {
 }
 
 func (rf *Raft) GetLog() []LogEntry {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return rf.log
 }
 
