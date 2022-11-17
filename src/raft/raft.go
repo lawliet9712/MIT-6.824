@@ -315,7 +315,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 	rf.snapshot.lastIncludedIndex = index
 	rf.lastApplied = rf.snapshot.lastIncludedIndex - 1
-	DPrintf("[Snapshot] %s do snapshot, index = %d, lastApplied=%d, rf.log=%v, size=%d", rf.role_info(), index, rf.lastApplied, rf.log)
+	DPrintf("[Snapshot] %s do snapshot, index = %d, lastApplied=%d, rf.log=%v", rf.role_info(), index, rf.lastApplied, rf.log)
 	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), rf.snapshot.data)
 }
 
