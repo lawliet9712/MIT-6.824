@@ -124,18 +124,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	ck := kv.GetCk(args.ClerkId)
 	// check msg
 	kv.mu.Lock()
-	// already process
-	if ck.seqId > args.SeqId {
-		reply.Err = OK
-		_, foundData := kv.dataSource[args.Key]
-		if !foundData {
-			reply.Err = ErrNoKey
-		} else {
-			reply.Value = kv.dataSource[args.Key]
-		}
-		kv.mu.Unlock()
-		return
-	}
 	//msgUniqueId := kv.GenMsgUniqueId()
 	//ck.msgUniqueId = msgUniqueId
 	DPrintf("[KVServer-%d] Received Req Get %v", kv.me, args)

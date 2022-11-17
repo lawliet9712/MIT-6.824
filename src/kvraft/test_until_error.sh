@@ -27,7 +27,7 @@ function loop_exe()
 function main()
 {
     echo --- Start ---
-    loop_exe "sh ./t.sh"
+    loop_exe "sh ./test_wrapper.sh"
     echo --- Done ---
 }
 
