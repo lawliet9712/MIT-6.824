@@ -97,6 +97,19 @@ func (kv *KVServer) WaitApplyMsgByCh(ch chan Op, ck *ClerkOps) (Op, Err) {
 	}
 }
 
+func (kv *KVServer) NotifyApplyMsgByCh(ch chan Op, Msg Op) {
+	// we wait 200ms 
+	// if notify timeout, then we ignore, because client probably send request to anthor server
+	timer := time.NewTimer(200 * time.Millisecond)
+	select {
+	case ch <- Msg:
+		return
+	case <-timer.C:
+		DPrintf("[KVServer-%d] NotifyApplyMsgByCh Msg=%v, timeout", kv.me, Msg)
+		return
+	}
+}
+
 func (kv *KVServer) GetCk(ckId int64) *ClerkOps {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -254,7 +267,7 @@ func (kv *KVServer) processMsg() {
 			// notify channel and reset timestamp
 			ck.msgUniqueId = 0
 			DPrintf("[KVServer-%d] Process Msg %v finish, ready send to ck.Ch, SeqId=%d isLeader=%v", kv.me, applyMsg, ck.seqId, isLeader)
-			ck.GetCh(Msg.Command) <- Msg
+			kv.NotifyApplyMsgByCh(ck.GetCh(Msg.Command), Msg)
 			DPrintf("[KVServer-%d] Process Msg %v Send to Rpc handler finish SeqId=%d isLeader=%v", kv.me, applyMsg, ck.seqId, isLeader)
 		}
 
