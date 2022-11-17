@@ -445,8 +445,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// record in local log
 	index = len(rf.log)
 	rf.log = append(rf.log, LogEntry{Term: term, Command: command})
-	rf.SendAppendEntries() // for lab3a TestSpeed
-	rf.heartbeatTimer.Reset(100 * time.Millisecond)
+	//rf.SendAppendEntries() // for lab3a TestSpeed
+	//rf.heartbeatTimer.Reset(100 * time.Millisecond)
 	rf.persist()
 	DPrintf("[Start] %s Add Log Index=%d Term=%d Command=%v\n", rf.role_info(), rf.getLogLogicSize(), rf.log[index].Term, rf.log[index].Command)
 	return rf.getLogLogicSize(), term, isLeader
