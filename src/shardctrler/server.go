@@ -74,14 +74,14 @@ func (sc *ShardCtrler) WaitApplyMsgByCh(ck *ShardClerk) (Op, bool) {
 	for {
 		select {
 		case Msg := <-ck.messageCh:
-			return Msg, true
+			return Msg, false
 		case <-timer.C:
 			curTerm, isLeader := sc.rf.GetState()
 			if curTerm != startTerm || !isLeader {
 				sc.mu.Lock()
 				ck.msgUniqueId = 0
 				sc.mu.Unlock()
-				return Op{}, false
+				return Op{}, true
 			}
 			timer.Reset(1000 * time.Millisecond)
 		}
@@ -105,6 +105,7 @@ func (sc *ShardCtrler) NotifyApplyMsgByCh(ch chan Op, Msg Op) {
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
 	sc.mu.Lock()
+	DPrintf("[ShardCtrler-%d] Received Req [Join] args=%v", sc.me, args)
 	logIndex, _, isLeader := sc.rf.Start(Op{
 		Servers: args.Servers,
 		SeqId:   args.SeqId,
@@ -128,6 +129,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
 	sc.mu.Lock()
+	DPrintf("[ShardCtrler-%d] Received Req [Leave] args=%v", sc.me, args)
 	logIndex, _, isLeader := sc.rf.Start(Op{
 		GIDs:    args.GIDs,
 		SeqId:   args.SeqId,
@@ -151,6 +153,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
 	sc.mu.Lock()
+	DPrintf("[ShardCtrler-%d] Received Req [Move] args=%v", sc.me, args)
 	logIndex, _, isLeader := sc.rf.Start(Op{
 		Shard:   args.Shard,
 		GID:     args.GID,
@@ -175,6 +178,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
 	sc.mu.Lock()
+	DPrintf("[ShardCtrler-%d] Received Req [Query] args=%v", sc.me, args)
 	logIndex, _, isLeader := sc.rf.Start(Op{
 		SeqId:   args.SeqId,
 		Command: T_Query,
@@ -182,6 +186,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	})
 	if !isLeader {
 		reply.WrongLeader = true
+		DPrintf("[ShardCtrler-%d] not leader,  Req [Move] args=%v", sc.me, args)
 		sc.mu.Unlock()
 		return
 	}
@@ -195,7 +200,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	defer sc.mu.Unlock()
 	reply.WrongLeader = WrongLeader
 	reply.Config = sc.getConfig(args.Num)
-	DPrintf("[ShardCtrler-%d] Clerk-%d Do [Query] Reply Config=%v", sc.me, args.CkId, reply.Config)
+	DPrintf("[ShardCtrler-%d] Clerk-%d Do [Query] Reply Config=%v", sc.me, args.CkId, reply)
 }
 
 func (sc *ShardCtrler) getGIDs() []int {
@@ -285,17 +290,22 @@ func (sc *ShardCtrler) processMsg() {
 		// already process
 		DPrintf("[ShardCtrler-%d] Received Msg %v", sc.me, applyMsg)
 		if opMsg.SeqId < ck.seqId {
+			DPrintf("[ShardCtrler-%d] already process Msg %v finish ... ", sc.me, applyMsg)
 			sc.mu.Unlock()
 			continue
 		}
 
 		_, isLeader := sc.rf.GetState()
 		if applyMsg.CommandIndex == ck.msgUniqueId && isLeader {
+			DPrintf("[ShardCtrler-%d] Ready Notify To %d Msg %v, msgUniqueId=%d", sc.me, opMsg.CkId, applyMsg, ck.msgUniqueId)
 			sc.NotifyApplyMsgByCh(ck.messageCh, opMsg)
+			DPrintf("[ShardCtrler-%d] Notify To %d Msg %v finish ... ", sc.me, opMsg.CkId, applyMsg)
 			ck.msgUniqueId = 0
 		}
 
+		ck.seqId = opMsg.SeqId + 1
 		sc.invokeMsg(opMsg)
+		sc.mu.Unlock()
 	}
 }
 

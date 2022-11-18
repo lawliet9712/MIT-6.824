@@ -4,16 +4,19 @@ package shardctrler
 // Shardctrler clerk.
 //
 
-import "6.824/labrpc"
-import "time"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
+
+	"6.824/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
-	ckId 	int64
-	seqId 	int
+	ckId  int64
+	seqId int
 }
 
 func nrand() int64 {
@@ -42,6 +45,7 @@ func (ck *Clerk) Query(num int) Config {
 	args.Num = num
 	args.CkId = ck.ckId
 	args.SeqId = ck.allocSeqId()
+	DPrintf("[Clerk-%d] call [Query], args=%v", ck.ckId, args)
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
