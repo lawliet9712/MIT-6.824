@@ -12,6 +12,8 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+	ckId 	int64
+	seqId 	int
 }
 
 func nrand() int64 {
@@ -21,10 +23,16 @@ func nrand() int64 {
 	return x
 }
 
+func (ck *Clerk) allocSeqId() int {
+	ck.seqId += 1
+	return ck.seqId
+}
+
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.ckId = nrand()
 	return ck
 }
 
@@ -32,6 +40,8 @@ func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
 	// Your code here.
 	args.Num = num
+	args.CkId = ck.ckId
+	args.SeqId = ck.allocSeqId()
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -49,7 +59,8 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	args := &JoinArgs{}
 	// Your code here.
 	args.Servers = servers
-
+	args.CkId = ck.ckId
+	args.SeqId = ck.allocSeqId()
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -67,7 +78,8 @@ func (ck *Clerk) Leave(gids []int) {
 	args := &LeaveArgs{}
 	// Your code here.
 	args.GIDs = gids
-
+	args.SeqId = ck.allocSeqId()
+	args.CkId = ck.ckId
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -86,7 +98,8 @@ func (ck *Clerk) Move(shard int, gid int) {
 	// Your code here.
 	args.Shard = shard
 	args.GID = gid
-
+	args.SeqId = ck.allocSeqId()
+	args.CkId = ck.ckId
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
