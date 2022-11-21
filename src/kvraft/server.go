@@ -33,8 +33,6 @@ type Op struct {
 	ClerkId     int64
 	SeqId       int
 	Server      int
-	MsgUniqueId int64 // Msg unique id, for rpc reply
-	Index       int
 }
 
 type KVState struct {
@@ -47,7 +45,6 @@ type ClerkOps struct {
 	getCh       chan Op
 	putAppendCh chan Op
 	msgUniqueId int // rpc waiting msg uid
-	mu          *sync.Mutex
 }
 
 func (ck *ClerkOps) GetCh(command string) chan Op {
@@ -111,34 +108,25 @@ func (kv *KVServer) NotifyApplyMsgByCh(ch chan Op, Msg Op) {
 }
 
 func (kv *KVServer) GetCk(ckId int64) *ClerkOps {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	ck, found := kv.messageMap[ckId]
 	if !found {
 		ck = new(ClerkOps)
 		ck.seqId = 0
 		ck.getCh = make(chan Op)
 		ck.putAppendCh = make(chan Op)
-		ck.mu = &kv.mu
 		kv.messageMap[ckId] = ck
 		DPrintf("[KVServer-%d] Init ck %d", kv.me, ckId)
 	}
 	return kv.messageMap[ckId]
 }
 
-func (kv *KVServer) GenMsgUniqueId() int64 {
-	return time.Now().UnixNano()
-}
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	// step 1 : start a command, check kv is leader, wait raft to commit command
 	//_, isLeader := kv.rf.GetState()
-	ck := kv.GetCk(args.ClerkId)
 	// check msg
 	kv.mu.Lock()
-	//msgUniqueId := kv.GenMsgUniqueId()
-	//ck.msgUniqueId = msgUniqueId
+	ck := kv.GetCk(args.ClerkId)
 	DPrintf("[KVServer-%d] Received Req Get %v", kv.me, args)
 	// start a command
 	logIndex, _, isLeader := kv.rf.Start(Op{
@@ -147,7 +135,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		ClerkId: args.ClerkId,
 		SeqId:   args.SeqId,
 		Server:  kv.me,
-		//MsgUniqueId: msgUniqueId,
 	})
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -183,18 +170,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	// step 1 : start a command, wait raft to commit command
 	// not found then init
-	ck := kv.GetCk(args.ClerkId)
 	// check msg
 	kv.mu.Lock()
+	ck := kv.GetCk(args.ClerkId)
 	// already process
 	if ck.seqId > args.SeqId {
 		kv.mu.Unlock()
 		reply.Err = OK
 		return
 	}
-	// test persist 的时候，可能出现 start 的同时收到消息
-	//msgUniqueId := kv.GenMsgUniqueId()
-	//ck.msgUniqueId = msgUniqueId
 	DPrintf("[KVServer-%d] Received Req PutAppend %v, SeqId=%d ", kv.me, args, args.SeqId)
 	// start a command
 	logIndex, _, isLeader := kv.rf.Start(Op{
@@ -204,7 +188,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClerkId: args.ClerkId,
 		SeqId:   args.SeqId,
 		Server:  kv.me,
-		//MsgUniqueId: msgUniqueId,
 	})
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -220,7 +203,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	Msg, err := kv.WaitApplyMsgByCh(ck.putAppendCh, ck)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	DPrintf("[KVServer-%d] Received Msg [PutAppend] from ck.putAppendCh args=%v, SeqId=%d, Msg=%v", kv.me, args, args.SeqId, Msg)
+	DPrintf("[KVServer-%d] Recived Msg [PutAppend] from ck.putAppendCh args=%v, SeqId=%d, Msg=%v", kv.me, args, args.SeqId, Msg)
 	reply.Err = err
 	if err != OK {
 		DPrintf("[KVServer-%d] leader change args=%v, SeqId=%d", kv.me, args, args.SeqId)
@@ -233,7 +216,6 @@ func (kv *KVServer) needSnapshot() bool {
 }
 
 func (kv *KVServer) processMsg() {
-	// this only happen in slave server
 	for {
 		applyMsg := <-kv.applyCh
 		if applyMsg.SnapshotValid {
@@ -242,10 +224,9 @@ func (kv *KVServer) processMsg() {
 		}
 		Msg := applyMsg.Command.(Op)
 		DPrintf("[KVServer-%d] Received Msg from channel. Msg=%v", kv.me, applyMsg)
-		//ck := kv.GetCk(Msg.ClerkId)
 
-		ck := kv.GetCk(Msg.ClerkId)
 		kv.mu.Lock()
+		ck := kv.GetCk(Msg.ClerkId)
 		// not now process this log
 		if Msg.SeqId > ck.seqId {
 			DPrintf("[KVServer-%d] Ignore Msg %v, Msg.Index > ck.index=%d", kv.me, applyMsg, ck.seqId)
@@ -330,8 +311,8 @@ func (kv *KVServer) readKVState(data []byte) {
 		DPrintf("[readKVState] decode failed ...")
 	} else {
 		for ckId, seqId := range cks {
-			ck := kv.GetCk(ckId)
 			kv.mu.Lock()
+			ck := kv.GetCk(ckId)
 			ck.seqId = seqId
 			kv.mu.Unlock()
 		}
