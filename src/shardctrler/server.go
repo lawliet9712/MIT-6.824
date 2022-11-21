@@ -244,6 +244,7 @@ func (sc *ShardCtrler) collectRichShardsAndPoorGroups(gids []int, avgShard int) 
 	poorGroups := make(map[int]int)
 	for _, gid := range(gids) {
 		groupShards := sc.getGroupShards(gid)
+		DPrintf("[ShardCtrler-%d] rebalance groupShards=%v, avgShard=%d, gids=%v", sc.me, groupShards, avgShard, gids)
 		overShards := len(groupShards) - avgShard
 		for i:=0; i < overShards; i++ {
 			richShards = append(richShards, groupShards[i])
@@ -280,8 +281,8 @@ func (sc *ShardCtrler) rebalance() {
 	// 2nd loop collect rich groups 
 	avgShard := (len(latestConf.Shards) / len(gids))
 	richShards, poorGroups := sc.collectRichShardsAndPoorGroups(gids, avgShard)
+	DPrintf("[ShardCtrler-%d] rebalance avgShard=%d idleShards=%v, richShards=%v, poorGroups=%v latestConf=%v", sc.me, avgShard, idleShards, richShards, poorGroups, latestConf)
 	idleShards = append(idleShards, richShards...)
-	DPrintf("[ShardCtrler-%d] rebalance idleShards=%v, poorGroups=%v", sc.me, idleShards, poorGroups)
 	sort.Ints(idleShards) 
 	allocIndex, i := 0, 0
 	// To prevent differnt server have diff result, sort it
