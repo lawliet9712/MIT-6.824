@@ -27,8 +27,8 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	ClerkId  int64
-	SeqId int
+	ClerkId int64
+	SeqId   int
 }
 
 type PutAppendReply struct {
@@ -38,8 +38,8 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
-	ClerkId  int64
-	SeqId int
+	ClerkId int64
+	SeqId   int
 }
 
 type GetReply struct {
@@ -48,12 +48,12 @@ type GetReply struct {
 }
 
 type RequestMoveShard struct {
-	Key string
-	Value string
+	Data    map[string]string
 	ClerkId int64
-	SeqId int
+	SeqId   int
+	Shard   int
 }
 
-type RequestMoveShard struct {
+type ReplyMoveShard struct {
 	Err
 }

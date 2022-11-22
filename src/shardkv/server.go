@@ -1,12 +1,15 @@
 package shardkv
 
+import (
+	"log"
+	"sync"
+	"time"
 
-import "6.824/labrpc"
-import "6.824/raft"
-import "sync"
-import "log"
-import "time"
-import "6.824/labgob"
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
+	"6.824/shardctrler"
+)
 
 const Debug = true
 
@@ -17,21 +20,22 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Key         string
-	Value       string
-	Command     string
-	ClerkId     int64
-	SeqId       int
+	Key       string
+	Value     string
+	Command   string
+	ClerkId   int64
+	SeqId     int
+	Shard     int // move shard rpc
+	ShardData map[string]string
 }
 
 type ShardKVClerk struct {
-	seqId 	  int
-	messageCh chan Op
+	seqId       int
+	messageCh   chan Op
 	msgUniqueId int
 }
 
@@ -46,10 +50,10 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	dataSource  map[string]string // db
-	shardkvClerks map[int64]*ShardKVClerk  // ckid to ck
-	mck       *shardctrler.Clerk // clerk
-	shards 	  []int // this group hold shards
+	dataSource    map[string]string       // db
+	shardkvClerks map[int64]*ShardKVClerk // ckid to ck
+	mck           *shardctrler.Clerk      // clerk
+	shards        []int                   // this group hold shards
 }
 
 func (kv *ShardKV) WaitApplyMsgByCh(ch chan Op, ck *ShardKVClerk) (Op, Err) {
@@ -73,7 +77,7 @@ func (kv *ShardKV) WaitApplyMsgByCh(ch chan Op, ck *ShardKVClerk) (Op, Err) {
 }
 
 func (kv *ShardKV) NotifyApplyMsgByCh(ch chan Op, Msg Op) {
-	// we wait 200ms 
+	// we wait 200ms
 	// if notify timeout, then we ignore, because client probably send request to anthor server
 	timer := time.NewTimer(200 * time.Millisecond)
 	select {
@@ -98,8 +102,8 @@ func (kv *ShardKV) GetCk(ckId int64) *ShardKVClerk {
 }
 
 /*
-	@note : check the request is valid ?
-	@retval : true mean message valid 
+@note : check the request is valid ?
+@retval : true mean message valid
 */
 func (kv *ShardKV) isRequestVaild() bool {
 	return true
@@ -181,12 +185,10 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 }
 
-//
 // the tester calls Kill() when a ShardKV instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
-//
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
@@ -232,34 +234,34 @@ func (kv *ShardKV) processMsg() {
 }
 
 /*
-type Config struct {
-	Num    int              // config number
-	Shards [NShards]int     // shard -> gid
-	Groups map[int][]string // gid -> servers[]
-}
+	type Config struct {
+		Num    int              // config number
+		Shards [NShards]int     // shard -> gid
+		Groups map[int][]string // gid -> servers[]
+	}
 */
 func isShardInGroup(shard int, dstShardGroup []int) bool {
-	for _, dstShard := range(dstShardGroup) {
+	for _, dstShard := range dstShardGroup {
 		if dstShard == shard {
 			return true
 		}
- 	}
-	 return false
+	}
+	return false
 }
 
 /*
-	rpc handler
+rpc handler
 */
 func (kv *ShardKV) MoveShard(args *RequestMoveShard, reply *ReplyMoveShard) {
 	kv.mu.Lock()
 	DPrintf("[ShardKV-%d] Received Req MoveShard %v, SeqId=%d ", kv.me, args, args.SeqId)
 	// start a command
 	logIndex, _, isLeader := kv.rf.Start(Op{
-		Key:     args.Key,
-		Value:   args.Value,
-		Command: "MoveShard",
-		ClerkId: args.ClerkId, // special clerk id for indicate move shard
-		SeqId: args.SeqId, 
+		ShardData: args.Data,
+		Command:   "MoveShard",
+		ClerkId:   args.ClerkId, // special clerk id for indicate move shard
+		SeqId:     args.SeqId,
+		Shard:     args.Shard,
 	})
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -285,63 +287,68 @@ func (kv *ShardKV) MoveShard(args *RequestMoveShard, reply *ReplyMoveShard) {
 }
 
 func (kv *ShardKV) invokeMoveShard(targetShard int, servers []string) {
-	for key, value := range(kv.dataSource) {
+	data := make(map[string]string)
+	for key, value := range kv.dataSource {
 		if key2shard(key) != targetShard {
 			continue
 		}
-		go func(reqKey string, reqValue string, dstServers []string) {
-			args := RequestMoveShard{
-				Key : reqKey,
-				Value : reqValue,
-			}
-			reply := ReplyMoveShard
-			// todo when all server access fail
-			for _, servername := range(dstServers) {
-				ok := kv.sendRequestMoveShard(dstGroup, &args, &reply)
-				if ok && reply.Err == OK {
-					DPrintf("[ShardKV-%d] move shard finish ...", kv.me)
-					break
-				}
-			}
-		}(key, value, servers)
+		data[key] = value
 	}
+	// notify shard new owner
+	go func(shardData map[string]string, dstServers []string) {
+		clerkId := (int64)(-1)
+		ck := kv.GetCk(clerkId)
+		args := RequestMoveShard{
+			Data:    shardData,
+			SeqId:   ck.seqId,
+			ClerkId: clerkId,
+		}
+		reply := ReplyMoveShard{}
+		// todo when all server access fail
+		for _, servername := range dstServers {
+			ok := kv.sendRequestMoveShard(servername, &args, &reply)
+			if ok && reply.Err == OK {
+				DPrintf("[ShardKV-%d] move shard finish ...", kv.me)
+				break
+			}
+		}
+	}(data, servers)
 }
 
 func (kv *ShardKV) intervalQueryConfig() {
 	queryInterval := 100 * time.Millisecond
 	for {
-		config = kv.mck.Query(-1)
+		config := kv.mck.Query(-1)
 		kvShards := make([]int, 0)
 		// collect group shards
-		for index, gid := range(config.Shards) {
+		for index, gid := range config.Shards {
 			if gid == kv.gid {
 				kvShards = append(kvShards, index)
 			}
 		}
 		// find the shard that leave this group
 		leaveShards := make(map[int]int) // shard idx to new gid
-		for _, shard := range(kv.shards) {
+		for _, shard := range kv.shards {
 			if !isShardInGroup(shard, kvShards) {
 				leaveShards[shard] = config.Shards[shard]
 			}
 		}
 		// move the shard
-		for shard, gid := range(leaveShards) {
+		for shard, gid := range leaveShards {
 			kv.invokeMoveShard(shard, config.Groups[gid])
 		}
-		// update shards
+		// update shards, only update the leave shard , the join shard need to update by msg from the channel
 		kv.shards = kvShards
 		time.Sleep(queryInterval)
 	}
 }
 
-func (kv *ShardKV) sendRequestMoveShard(servername string, args *RequestMoveShard, reply *ReplyMoveShard) {
+func (kv *ShardKV) sendRequestMoveShard(servername string, args *RequestMoveShard, reply *ReplyMoveShard) bool {
 	srv := kv.make_end(servername)
 	ok := srv.Call("ShardKV.MoveShard", args, reply)
 	return ok
 }
 
-//
 // servers[] contains the ports of the servers in this group.
 //
 // me is the index of the current server in servers[].
@@ -368,7 +375,6 @@ func (kv *ShardKV) sendRequestMoveShard(servername string, args *RequestMoveShar
 //
 // StartServer() must return quickly, so it should start goroutines
 // for any long-running work.
-//
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
