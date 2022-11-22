@@ -46,3 +46,14 @@ type GetReply struct {
 	Err   Err
 	Value string
 }
+
+type RequestMoveShard struct {
+	Key string
+	Value string
+	ClerkId int64
+	SeqId int
+}
+
+type RequestMoveShard struct {
+	Err
+}

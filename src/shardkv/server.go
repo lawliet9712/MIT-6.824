@@ -48,6 +48,8 @@ type ShardKV struct {
 	// Your definitions here.
 	dataSource  map[string]string // db
 	shardkvClerks map[int64]*ShardKVClerk  // ckid to ck
+	mck       *shardctrler.Clerk // clerk
+	shards 	  []int // this group hold shards
 }
 
 func (kv *ShardKV) WaitApplyMsgByCh(ch chan Op, ck *ShardKVClerk) (Op, Err) {
@@ -229,11 +231,114 @@ func (kv *ShardKV) processMsg() {
 	}
 }
 
-func (kv *ShardKV) queryForever() {
+/*
+type Config struct {
+	Num    int              // config number
+	Shards [NShards]int     // shard -> gid
+	Groups map[int][]string // gid -> servers[]
+}
+*/
+func isShardInGroup(shard int, dstShardGroup []int) bool {
+	for _, dstShard := range(dstShardGroup) {
+		if dstShard == shard {
+			return true
+		}
+ 	}
+	 return false
+}
+
+/*
+	rpc handler
+*/
+func (kv *ShardKV) MoveShard(args *RequestMoveShard, reply *ReplyMoveShard) {
+	kv.mu.Lock()
+	DPrintf("[ShardKV-%d] Received Req MoveShard %v, SeqId=%d ", kv.me, args, args.SeqId)
+	// start a command
+	logIndex, _, isLeader := kv.rf.Start(Op{
+		Key:     args.Key,
+		Value:   args.Value,
+		Command: "MoveShard",
+		ClerkId: args.ClerkId, // special clerk id for indicate move shard
+		SeqId: args.SeqId, 
+	})
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	ck := kv.GetCk(args.ClerkId)
+	ck.msgUniqueId = logIndex
+	DPrintf("[ShardKV-%d] Received Req MoveShard %v, waiting logIndex=%d", kv.me, args, logIndex)
+	kv.mu.Unlock()
+	// step 2 : wait the channel
+	reply.Err = OK
+	Msg, err := kv.WaitApplyMsgByCh(ck.messageCh, ck)
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	DPrintf("[ShardKV-%d] Recived Msg [MoveShard] from ck.channel args=%v, SeqId=%d, Msg=%v", kv.me, args, args.SeqId, Msg)
+	reply.Err = err
+	if err != OK {
+		DPrintf("[ShardKV-%d] leader change args=%v, SeqId=%d", kv.me, args, args.SeqId)
+		return
+	}
+}
+
+func (kv *ShardKV) invokeMoveShard(targetShard int, servers []string) {
+	for key, value := range(kv.dataSource) {
+		if key2shard(key) != targetShard {
+			continue
+		}
+		go func(reqKey string, reqValue string, dstServers []string) {
+			args := RequestMoveShard{
+				Key : reqKey,
+				Value : reqValue,
+			}
+			reply := ReplyMoveShard
+			// todo when all server access fail
+			for _, servername := range(dstServers) {
+				ok := kv.sendRequestMoveShard(dstGroup, &args, &reply)
+				if ok && reply.Err == OK {
+					DPrintf("[ShardKV-%d] move shard finish ...", kv.me)
+					break
+				}
+			}
+		}(key, value, servers)
+	}
+}
+
+func (kv *ShardKV) intervalQueryConfig() {
 	queryInterval := 100 * time.Millisecond
 	for {
+		config = kv.mck.Query(-1)
+		kvShards := make([]int, 0)
+		// collect group shards
+		for index, gid := range(config.Shards) {
+			if gid == kv.gid {
+				kvShards = append(kvShards, index)
+			}
+		}
+		// find the shard that leave this group
+		leaveShards := make(map[int]int) // shard idx to new gid
+		for _, shard := range(kv.shards) {
+			if !isShardInGroup(shard, kvShards) {
+				leaveShards[shard] = config.Shards[shard]
+			}
+		}
+		// move the shard
+		for shard, gid := range(leaveShards) {
+			kv.invokeMoveShard(shard, config.Groups[gid])
+		}
+		// update shards
+		kv.shards = kvShards
 		time.Sleep(queryInterval)
 	}
+}
+
+func (kv *ShardKV) sendRequestMoveShard(servername string, args *RequestMoveShard, reply *ReplyMoveShard) {
+	srv := kv.make_end(servername)
+	ok := srv.Call("ShardKV.MoveShard", args, reply)
+	return ok
 }
 
 //
@@ -277,15 +382,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
-
-	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
-
+	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.dataSource = make(map[string]string)
 	kv.shardkvClerks = make(map[int64]*ShardKVClerk)
-
+	kv.shards = make([]int, 0)
 	go kv.processMsg()
+	go kv.intervalQueryConfig()
 	return kv
 }
