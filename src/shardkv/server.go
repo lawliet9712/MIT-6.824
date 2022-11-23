@@ -54,6 +54,7 @@ type ShardKV struct {
 	shardkvClerks map[int64]*ShardKVClerk // ckid to ck
 	mck           *shardctrler.Clerk      // clerk
 	shards        []int                   // this group hold shards
+	ShardCond     sync.Cond				  // condition vari, before shard move done , all request will wait here
 }
 
 func (kv *ShardKV) WaitApplyMsgByCh(ch chan Op, ck *ShardKVClerk) (Op, Err) {
@@ -105,8 +106,21 @@ func (kv *ShardKV) GetCk(ckId int64) *ShardKVClerk {
 @note : check the request is valid ?
 @retval : true mean message valid
 */
-func (kv *ShardKV) isRequestVaild() bool {
-	return true
+func (kv *ShardKV) isRequestVaild(key string) Err {
+	// check key belong shard still hold in this group ?
+	keyShard := key2shard(key)
+	config := kv.mck.Query(-1)
+	if !isShardInGroup(keyShard, config.Groups[kv.gid]) {
+		return ErrWrongGroup
+	}
+
+	// check shard in current config ?
+	kv.shardCond.L.Lock()
+	for !isShardInGroup(keyShard, kv.shards) {
+		kv.shardCond.Wait()
+	}
+	kv.shardCond.L.Unlock()
+	return OK
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -227,10 +241,23 @@ func (kv *ShardKV) processMsg() {
 			kv.dataSource[Msg.Key] += Msg.Value
 		case "Get":
 			DPrintf("[ShardKV-%d] Excute CkId=%d Get Msg=%v kvdata=%v", kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
+		case "MoveShard":
+			kv.shardJoin(Msg.Shard, Msg.ShardData)
 		}
 		ck.seqId = Msg.SeqId + 1
 		kv.mu.Unlock()
 	}
+}
+
+func (kv *ShardKV) shardJoin(shard int, shardData map[string]string) {
+	// just put it in
+	for key, value := range shardData {
+		kv.dataSource[key] = value
+	}
+	// add shard config
+	kv.shards = append(kv.shards, shard)
+	// broad cast all request continue
+	kv.shardCond.Broadcast()
 }
 
 /*
@@ -394,6 +421,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.dataSource = make(map[string]string)
 	kv.shardkvClerks = make(map[int64]*ShardKVClerk)
 	kv.shards = make([]int, 0)
+	kv.shardCond = sync.Cond{L:&sync.Mutex{}}
 	go kv.processMsg()
 	go kv.intervalQueryConfig()
 	return kv
