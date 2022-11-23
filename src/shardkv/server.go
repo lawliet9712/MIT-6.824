@@ -55,6 +55,7 @@ type ShardKV struct {
 	mck           *shardctrler.Clerk      // clerk
 	shards        []int                   // this group hold shards
 	shardCond     sync.Cond               // condition vari, before shard move done , all request will wait here
+	clerkId       int64                   // uid for move shard
 }
 
 func (kv *ShardKV) WaitApplyMsgByCh(ch chan Op, ck *ShardKVClerk) (Op, Err) {
@@ -344,7 +345,7 @@ func (kv *ShardKV) invokeMoveShard(shards []int, servers []string) {
 		}
 	}
 	// notify shard new owner
-	clerkId := (int64)(-1)
+	clerkId := kv.clerkId
 	ck := kv.GetCk(clerkId)
 	ck.seqId += 1
 	args := RequestMoveShard{
@@ -454,7 +455,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
-	DPrintf("[ShardKV-%d-%d] Starting ...", kv.gid, kv.me)
 	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -462,6 +462,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.shardkvClerks = make(map[int64]*ShardKVClerk)
 	kv.shards = make([]int, 0)
 	kv.shardCond = sync.Cond{L: &sync.Mutex{}}
+	kv.clerkId = nrand()
+	DPrintf("[ShardKV-%d-%d] Starting ... ClerkId=%d", kv.gid, kv.me, kv.clerkId)
 	go kv.processMsg()
 	go kv.intervalQueryConfig()
 	return kv
