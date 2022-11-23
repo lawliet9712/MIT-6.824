@@ -54,7 +54,7 @@ type ShardKV struct {
 	shardkvClerks map[int64]*ShardKVClerk // ckid to ck
 	mck           *shardctrler.Clerk      // clerk
 	shards        []int                   // this group hold shards
-	ShardCond     sync.Cond				  // condition vari, before shard move done , all request will wait here
+	shardCond     sync.Cond               // condition vari, before shard move done , all request will wait here
 }
 
 func (kv *ShardKV) WaitApplyMsgByCh(ch chan Op, ck *ShardKVClerk) (Op, Err) {
@@ -85,7 +85,7 @@ func (kv *ShardKV) NotifyApplyMsgByCh(ch chan Op, Msg Op) {
 	case ch <- Msg:
 		return
 	case <-timer.C:
-		DPrintf("[ShardKV-%d] NotifyApplyMsgByCh Msg=%v, timeout", kv.me, Msg)
+		DPrintf("[ShardKV-%d-%d] NotifyApplyMsgByCh Msg=%v, timeout", kv.gid, kv.me, Msg)
 		return
 	}
 }
@@ -97,21 +97,24 @@ func (kv *ShardKV) GetCk(ckId int64) *ShardKVClerk {
 		ck.seqId = 0
 		ck.messageCh = make(chan Op)
 		kv.shardkvClerks[ckId] = ck
-		DPrintf("[ShardKV-%d] Init ck %d", kv.me, ckId)
+		DPrintf("[ShardKV-%d-%d] Init ck %d", kv.gid, kv.me, ckId)
 	}
 	return kv.shardkvClerks[ckId]
 }
 
 /*
-@note : check the request is valid ?
+@note : check the request key is correct  ?
 @retval : true mean message valid
 */
-func (kv *ShardKV) isRequestVaild(key string) Err {
+func (kv *ShardKV) isRequestKeyCorrect(key string) bool {
 	// check key belong shard still hold in this group ?
 	keyShard := key2shard(key)
 	config := kv.mck.Query(-1)
-	if !isShardInGroup(keyShard, config.Groups[kv.gid]) {
-		return ErrWrongGroup
+	for shard, gid := range config.Shards {
+		if shard == keyShard && gid != kv.gid {
+			DPrintf("[ShardKV-%d-%d] keyShard=%d not in this group, config=%v", kv.gid, kv.me, keyShard, config)
+			return false
+		}
 	}
 
 	// check shard in current config ?
@@ -120,13 +123,19 @@ func (kv *ShardKV) isRequestVaild(key string) Err {
 		kv.shardCond.Wait()
 	}
 	kv.shardCond.L.Unlock()
-	return OK
+	return true
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
-	DPrintf("[ShardKV-%d] Received Req Get %v", kv.me, args)
+	DPrintf("[ShardKV-%d-%d] Received Req Get %v", kv.gid, kv.me, args)
+	if !kv.isRequestKeyCorrect(args.Key) {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+
 	// start a command
 	ck := kv.GetCk(args.ClerkId)
 	logIndex, _, isLeader := kv.rf.Start(Op{
@@ -141,14 +150,14 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Unlock()
 		return
 	}
-	DPrintf("[ShardKV-%d] Received Req Get %v, waiting logIndex=%d", kv.me, args, logIndex)
+	DPrintf("[ShardKV-%d-%d] Received Req Get %v, waiting logIndex=%d", kv.gid, kv.me, args, logIndex)
 	ck.msgUniqueId = logIndex
 	kv.mu.Unlock()
 	// step 2 : parse op struct
 	getMsg, err := kv.WaitApplyMsgByCh(ck.messageCh, ck)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	DPrintf("[ShardKV-%d] Received Msg [Get] args=%v, SeqId=%d, Msg=%v", kv.me, args, args.SeqId, getMsg)
+	DPrintf("[ShardKV-%d-%d] Received Msg [Get] args=%v, SeqId=%d, Msg=%v", kv.gid, kv.me, args, args.SeqId, getMsg)
 	reply.Err = err
 	if err != OK {
 		// leadership change, return ErrWrongLeader
@@ -160,14 +169,20 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrNoKey
 	} else {
 		reply.Value = kv.dataSource[getMsg.Key]
-		DPrintf("[ShardKV-%d] Excute Get %s is %s", kv.me, getMsg.Key, reply.Value)
+		DPrintf("[ShardKV-%d-%d] Excute Get %s is %s", kv.gid, kv.me, getMsg.Key, reply.Value)
 	}
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
-	DPrintf("[ShardKV-%d] Received Req PutAppend %v, SeqId=%d ", kv.me, args, args.SeqId)
+	DPrintf("[ShardKV-%d-%d] Received Req PutAppend %v, SeqId=%d ", kv.gid, kv.me, args, args.SeqId)
+	if !kv.isRequestKeyCorrect(args.Key) {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+
 	// start a command
 	logIndex, _, isLeader := kv.rf.Start(Op{
 		Key:     args.Key,
@@ -184,17 +199,17 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	ck := kv.GetCk(args.ClerkId)
 	ck.msgUniqueId = logIndex
-	DPrintf("[ShardKV-%d] Received Req PutAppend %v, waiting logIndex=%d", kv.me, args, logIndex)
+	DPrintf("[ShardKV-%d-%d] Received Req PutAppend %v, waiting logIndex=%d", kv.gid, kv.me, args, logIndex)
 	kv.mu.Unlock()
 	// step 2 : wait the channel
 	reply.Err = OK
 	Msg, err := kv.WaitApplyMsgByCh(ck.messageCh, ck)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	DPrintf("[ShardKV-%d] Recived Msg [PutAppend] from ck.putAppendCh args=%v, SeqId=%d, Msg=%v", kv.me, args, args.SeqId, Msg)
+	DPrintf("[ShardKV-%d-%d] Recived Msg [PutAppend] from ck.putAppendCh args=%v, SeqId=%d, Msg=%v", kv.gid, kv.me, args, args.SeqId, Msg)
 	reply.Err = err
 	if err != OK {
-		DPrintf("[ShardKV-%d] leader change args=%v, SeqId=%d", kv.me, args, args.SeqId)
+		DPrintf("[ShardKV-%d-%d] leader change args=%v, SeqId=%d", kv.gid, kv.me, args, args.SeqId)
 		return
 	}
 }
@@ -212,7 +227,7 @@ func (kv *ShardKV) processMsg() {
 	for {
 		applyMsg := <-kv.applyCh
 		Msg := applyMsg.Command.(Op)
-		DPrintf("[ShardKV-%d] Received Msg from channel. Msg=%v", kv.me, applyMsg)
+		DPrintf("[ShardKV-%d-%d] Received Msg from channel. Msg=%v", kv.gid, kv.me, applyMsg)
 
 		kv.mu.Lock()
 		ck := kv.GetCk(Msg.ClerkId)
@@ -221,13 +236,13 @@ func (kv *ShardKV) processMsg() {
 		needNotify := ck.msgUniqueId == applyMsg.CommandIndex
 		if isLeader && needNotify {
 			ck.msgUniqueId = 0
-			DPrintf("[ShardKV-%d] Process Msg %v finish, ready send to ck.Ch, SeqId=%d isLeader=%v", kv.me, applyMsg, ck.seqId, isLeader)
+			DPrintf("[ShardKV-%d-%d] Process Msg %v finish, ready send to ck.Ch, SeqId=%d isLeader=%v", kv.gid, kv.me, applyMsg, ck.seqId, isLeader)
 			kv.NotifyApplyMsgByCh(ck.messageCh, Msg)
-			DPrintf("[ShardKV-%d] Process Msg %v Send to Rpc handler finish SeqId=%d isLeader=%v", kv.me, applyMsg, ck.seqId, isLeader)
+			DPrintf("[ShardKV-%d-%d] Process Msg %v Send to Rpc handler finish SeqId=%d isLeader=%v", kv.gid, kv.me, applyMsg, ck.seqId, isLeader)
 		}
 
 		if Msg.SeqId < ck.seqId {
-			DPrintf("[ShardKV-%d] Ignore Msg %v,  Msg.SeqId < ck.seqId", kv.me, applyMsg)
+			DPrintf("[ShardKV-%d-%d] Ignore Msg %v,  Msg.SeqId < ck.seqId", kv.gid, kv.me, applyMsg)
 			kv.mu.Unlock()
 			continue
 		}
@@ -235,13 +250,14 @@ func (kv *ShardKV) processMsg() {
 		switch Msg.Command {
 		case "Put":
 			kv.dataSource[Msg.Key] = Msg.Value
-			DPrintf("[ShardKV-%d] Excute CkId=%d Put Msg=%v, kvdata=%v", kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
+			DPrintf("[ShardKV-%d-%d] Excute CkId=%d Put Msg=%v, kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
 		case "Append":
-			DPrintf("[ShardKV-%d] Excute CkId=%d Append Msg=%v kvdata=%v", kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
+			DPrintf("[ShardKV-%d-%d] Excute CkId=%d Append Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
 			kv.dataSource[Msg.Key] += Msg.Value
 		case "Get":
-			DPrintf("[ShardKV-%d] Excute CkId=%d Get Msg=%v kvdata=%v", kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
+			DPrintf("[ShardKV-%d-%d] Excute CkId=%d Get Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
 		case "MoveShard":
+			DPrintf("[ShardKV-%d-%d] Excute CkId=%d ShardJoin Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
 			kv.shardJoin(Msg.Shard, Msg.ShardData)
 		}
 		ck.seqId = Msg.SeqId + 1
@@ -251,6 +267,9 @@ func (kv *ShardKV) processMsg() {
 
 func (kv *ShardKV) shardJoin(shard int, shardData map[string]string) {
 	// just put it in
+	kv.shardCond.L.Lock()
+	defer kv.shardCond.L.Unlock()
+	DPrintf("[ShardKV-%d-%d] Excute shardJoin shard=%d, ShardData=%v", kv.gid, kv.me, shard, shardData)
 	for key, value := range shardData {
 		kv.dataSource[key] = value
 	}
@@ -281,7 +300,7 @@ rpc handler
 */
 func (kv *ShardKV) MoveShard(args *RequestMoveShard, reply *ReplyMoveShard) {
 	kv.mu.Lock()
-	DPrintf("[ShardKV-%d] Received Req MoveShard %v, SeqId=%d ", kv.me, args, args.SeqId)
+	DPrintf("[ShardKV-%d-%d] Received Req MoveShard %v, SeqId=%d ", kv.gid, kv.me, args, args.SeqId)
 	// start a command
 	logIndex, _, isLeader := kv.rf.Start(Op{
 		ShardData: args.Data,
@@ -298,55 +317,68 @@ func (kv *ShardKV) MoveShard(args *RequestMoveShard, reply *ReplyMoveShard) {
 
 	ck := kv.GetCk(args.ClerkId)
 	ck.msgUniqueId = logIndex
-	DPrintf("[ShardKV-%d] Received Req MoveShard %v, waiting logIndex=%d", kv.me, args, logIndex)
+	DPrintf("[ShardKV-%d-%d] Received Req MoveShard %v, waiting logIndex=%d", kv.gid, kv.me, args, logIndex)
 	kv.mu.Unlock()
 	// step 2 : wait the channel
 	reply.Err = OK
 	Msg, err := kv.WaitApplyMsgByCh(ck.messageCh, ck)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	DPrintf("[ShardKV-%d] Recived Msg [MoveShard] from ck.channel args=%v, SeqId=%d, Msg=%v", kv.me, args, args.SeqId, Msg)
+	DPrintf("[ShardKV-%d-%d] Recived Msg [MoveShard] from ck.channel args=%v, SeqId=%d, Msg=%v", kv.gid, kv.me, args, args.SeqId, Msg)
 	reply.Err = err
 	if err != OK {
-		DPrintf("[ShardKV-%d] leader change args=%v, SeqId=%d", kv.me, args, args.SeqId)
+		DPrintf("[ShardKV-%d-%d] leader change args=%v, SeqId=%d", kv.gid, kv.me, args, args.SeqId)
 		return
 	}
 }
 
-func (kv *ShardKV) invokeMoveShard(targetShard int, servers []string) {
+func (kv *ShardKV) invokeMoveShard(shards []int, servers []string) {
+	kv.mu.Lock()
 	data := make(map[string]string)
-	for key, value := range kv.dataSource {
-		if key2shard(key) != targetShard {
-			continue
+	for _, moveShard := range shards {
+		for key, value := range kv.dataSource {
+			if key2shard(key) != moveShard {
+				continue
+			}
+			data[key] = value
 		}
-		data[key] = value
 	}
 	// notify shard new owner
-	go func(shardData map[string]string, dstServers []string) {
-		clerkId := (int64)(-1)
-		ck := kv.GetCk(clerkId)
-		args := RequestMoveShard{
-			Data:    shardData,
-			SeqId:   ck.seqId,
-			ClerkId: clerkId,
+	clerkId := (int64)(-1)
+	ck := kv.GetCk(clerkId)
+	ck.seqId += 1
+	args := RequestMoveShard{
+		Data:    data,
+		SeqId:   ck.seqId,
+		ClerkId: clerkId,
+	}
+	kv.mu.Unlock()
+	reply := ReplyMoveShard{}
+	// todo when all server access fail
+	for _, servername := range servers {
+		ok := kv.sendRequestMoveShard(servername, &args, &reply)
+		if ok && reply.Err == OK {
+			DPrintf("[ShardKV-%d-%d] move shard finish ...", kv.gid, kv.me)
+			break
 		}
-		reply := ReplyMoveShard{}
-		// todo when all server access fail
-		for _, servername := range dstServers {
-			ok := kv.sendRequestMoveShard(servername, &args, &reply)
-			if ok && reply.Err == OK {
-				DPrintf("[ShardKV-%d] move shard finish ...", kv.me)
-				break
-			}
+	}
+}
+
+func (kv *ShardKV) removeShard(shard int) {
+	for i := 0; i < len(kv.shards); i++ {
+		if kv.shards[i] == shard {
+			kv.shards = append(kv.shards[:i], kv.shards[i+1:]...)
+			i-- // maintain the correct index
 		}
-	}(data, servers)
+	}
 }
 
 func (kv *ShardKV) intervalQueryConfig() {
 	queryInterval := 100 * time.Millisecond
 	for {
+		kv.mu.Lock()
 		config := kv.mck.Query(-1)
-		kvShards := make([]int, 0)
+		kvShards := make([]int, 10)
 		// collect group shards
 		for index, gid := range config.Shards {
 			if gid == kv.gid {
@@ -354,18 +386,25 @@ func (kv *ShardKV) intervalQueryConfig() {
 			}
 		}
 		// find the shard that leave this group
-		leaveShards := make(map[int]int) // shard idx to new gid
+		leaveShards := make(map[int][]int) // shard idx to new gid
 		for _, shard := range kv.shards {
 			if !isShardInGroup(shard, kvShards) {
-				leaveShards[shard] = config.Shards[shard]
+				shardNewGroup := config.Shards[shard]
+				if _, found := leaveShards[shardNewGroup]; !found {
+					leaveShards[shardNewGroup] = make([]int, 0)
+				}
+				leaveShards[shardNewGroup] = append(leaveShards[shardNewGroup], shard)
 			}
 		}
 		// move the shard
-		for shard, gid := range leaveShards {
-			kv.invokeMoveShard(shard, config.Groups[gid])
+		for gid, shards := range leaveShards {
+			go kv.invokeMoveShard(shards, config.Groups[gid])
 		}
 		// update shards, only update the leave shard , the join shard need to update by msg from the channel
-		kv.shards = kvShards
+		for _, leaveShard := range leaveShards[kv.gid] {
+			kv.removeShard(leaveShard)
+		}
+		kv.mu.Unlock()
 		time.Sleep(queryInterval)
 	}
 }
@@ -415,13 +454,14 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
+	DPrintf("[ShardKV-%d-%d] Starting ...", kv.gid, kv.me)
 	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.dataSource = make(map[string]string)
 	kv.shardkvClerks = make(map[int64]*ShardKVClerk)
 	kv.shards = make([]int, 0)
-	kv.shardCond = sync.Cond{L:&sync.Mutex{}}
+	kv.shardCond = sync.Cond{L: &sync.Mutex{}}
 	go kv.processMsg()
 	go kv.intervalQueryConfig()
 	return kv

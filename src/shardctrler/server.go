@@ -2,15 +2,16 @@ package shardctrler
 
 import (
 	"log"
+	"sort"
 	"sync"
 	"time"
-	"sort"
+
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
 )
 
-const Debug = true
+const Debug = false
 const InvalidGroup = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -234,19 +235,22 @@ func (sc *ShardCtrler) getConfig(confNumber int) Config {
 }
 
 /*
-	@note "rich shard" meaning the group have shard count more then avgShard	
-		  "poor groups" meaing the group have shard count small than avgshard
-	@retval int[] rich shard, array element is shard index in the config
-		    map[int]int[] poor groups, key is gid, value is the group have shard count
+@note "rich shard" meaning the group have shard count more then avgShard
+
+	"poor groups" meaing the group have shard count small than avgshard
+
+@retval int[] rich shard, array element is shard index in the config
+
+	map[int]int[] poor groups, key is gid, value is the group have shard count
 */
-func (sc *ShardCtrler) collectRichShardsAndPoorGroups(gids []int, avgShard int) ([]int, map[int]int){
+func (sc *ShardCtrler) collectRichShardsAndPoorGroups(gids []int, avgShard int) ([]int, map[int]int) {
 	richShards := make([]int, 0)
 	poorGroups := make(map[int]int)
-	for _, gid := range(gids) {
+	for _, gid := range gids {
 		groupShards := sc.getGroupShards(gid)
 		DPrintf("[ShardCtrler-%d] rebalance groupShards=%v, avgShard=%d, gids=%v", sc.me, groupShards, avgShard, gids)
 		overShards := len(groupShards) - avgShard
-		for i:=0; i < overShards; i++ {
+		for i := 0; i < overShards; i++ {
 			richShards = append(richShards, groupShards[i])
 		}
 		if overShards < 0 {
@@ -261,7 +265,7 @@ func (sc *ShardCtrler) rebalance() {
 	latestConf := sc.getConfig(-1)
 	// if all groups leave, reset all shards
 	if len(latestConf.Groups) == 0 {
-		for index, _ := range(latestConf.Shards) {
+		for index, _ := range latestConf.Shards {
 			latestConf.Shards[index] = InvalidGroup
 		}
 		DPrintf("[ShardCtrler-%d] not groups, rebalance result=%v, sc.config=%v", sc.me, latestConf.Shards, sc.configs)
@@ -271,29 +275,29 @@ func (sc *ShardCtrler) rebalance() {
 	// step 1 : collect invalid shard
 	gids := sc.getGIDs()
 	idleShards := make([]int, 0)
-	// 1st loop collect not distribute shard 
-	for index, belongGroup := range(latestConf.Shards) {
+	// 1st loop collect not distribute shard
+	for index, belongGroup := range latestConf.Shards {
 		// not alloc shard or shard belong group already leave
 		if belongGroup == InvalidGroup || !xIsInGroup(belongGroup, gids) {
 			idleShards = append(idleShards, index)
 		}
 	}
-	// 2nd loop collect rich groups 
+	// 2nd loop collect rich groups
 	avgShard := (len(latestConf.Shards) / len(gids))
 	richShards, poorGroups := sc.collectRichShardsAndPoorGroups(gids, avgShard)
 	DPrintf("[ShardCtrler-%d] rebalance avgShard=%d idleShards=%v, richShards=%v, poorGroups=%v latestConf=%v", sc.me, avgShard, idleShards, richShards, poorGroups, latestConf)
 	idleShards = append(idleShards, richShards...)
-	sort.Ints(idleShards) 
+	sort.Ints(idleShards)
 	allocIndex, i := 0, 0
 	// To prevent differnt server have diff result, sort it
 	poorGIDs := make([]int, 0)
-	for gid := range(poorGroups) {
+	for gid := range poorGroups {
 		poorGIDs = append(poorGIDs, gid)
 	}
 	sort.Ints(poorGIDs)
-	for _, gid := range(poorGIDs) {
+	for _, gid := range poorGIDs {
 		groupShardsNum := poorGroups[gid]
-		for i=allocIndex; i<len(idleShards); i++ {
+		for i = allocIndex; i < len(idleShards); i++ {
 			groupShardsNum += 1
 			latestConf.Shards[idleShards[i]] = gid
 			if groupShardsNum > avgShard {
@@ -304,10 +308,10 @@ func (sc *ShardCtrler) rebalance() {
 	}
 	// 3rd alloc left shard
 	for ; allocIndex < len(idleShards); allocIndex++ {
-		i = allocIndex%len(gids)
+		i = allocIndex % len(gids)
 		latestConf.Shards[idleShards[allocIndex]] = gids[i]
 	}
-	sc.configs[len(sc.configs) - 1] = latestConf
+	sc.configs[len(sc.configs)-1] = latestConf
 	DPrintf("[ShardCtrler-%d] rebalance result=%v, sc.config=%v", sc.me, latestConf.Shards, sc.getConfig(-1))
 }
 
