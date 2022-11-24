@@ -51,7 +51,7 @@ type RequestMoveShard struct {
 	Data    map[string]string
 	ClerkId int64
 	SeqId   int
-	Shard   int
+	Shards  []int
 }
 
 type ReplyMoveShard struct {
