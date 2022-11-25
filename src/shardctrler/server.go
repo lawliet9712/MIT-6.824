@@ -375,6 +375,7 @@ func (sc *ShardCtrler) processMsg() {
 	for {
 		applyMsg := <-sc.applyCh
 		opMsg := applyMsg.Command.(Op)
+		_, isLeader := sc.rf.GetState()
 		sc.mu.Lock()
 		ck := sc.GetCk(opMsg.CkId)
 		// already process
@@ -385,7 +386,6 @@ func (sc *ShardCtrler) processMsg() {
 			continue
 		}
 
-		_, isLeader := sc.rf.GetState()
 		if applyMsg.CommandIndex == ck.msgUniqueId && isLeader {
 			DPrintf("[ShardCtrler-%d] Ready Notify To %d Msg %v, msgUniqueId=%d", sc.me, opMsg.CkId, applyMsg, ck.msgUniqueId)
 			sc.NotifyApplyMsgByCh(ck.messageCh, opMsg)

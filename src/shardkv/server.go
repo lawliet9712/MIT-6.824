@@ -112,10 +112,9 @@ func (kv *ShardKV) GetCk(ckId int64) *ShardKVClerk {
 */
 func (kv *ShardKV) isRequestKeyCorrect(key string) bool {
 	// check key belong shard still hold in this group ?
-	keyShard := key2shard(key)
-	kv.mu.Lock()
+	/*
+	
 	config := kv.mck.Query(-1)
-	kv.mu.Unlock()
 	for shard, gid := range config.Shards {
 		if shard == keyShard && gid != kv.gid {
 			DPrintf("[ShardKV-%d-%d] keyShard=%d not in this group, config=%v", kv.gid, kv.me, keyShard, config)
@@ -136,7 +135,10 @@ func (kv *ShardKV) isRequestKeyCorrect(key string) bool {
 		kv.shardCond.Wait()
 	}
 	kv.shardCond.L.Unlock()
-	return true
+	*/
+	keyShard := key2shard(key)
+	return isShardInGroup(keyShard, kv.shards)
+	//return true
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -235,11 +237,15 @@ func (kv *ShardKV) readKVState(data []byte) {
 	d := labgob.NewDecoder(r)
 	cks := make(map[int64]int)
 	dataSource := make(map[string]string)
+	shards := make([]int, 0)
 	var clerkId int64
+	var seqId   int
 	//var commitIndex int
 	if d.Decode(&cks) != nil ||
 		d.Decode(&dataSource) != nil ||
-		d.Decode(&clerkId) != nil {
+		d.Decode(&clerkId) != nil || 
+		d.Decode(&seqId) != nil || 
+		d.Decode(&shards) != nil {
 		DPrintf("[readKVState] decode failed ...")
 	} else {
 		for ckId, seqId := range cks {
@@ -251,7 +257,13 @@ func (kv *ShardKV) readKVState(data []byte) {
 		kv.mu.Lock()
 		kv.dataSource = dataSource
 		kv.clerkId = clerkId
-		DPrintf("[ShardKV-%d-%d] readKVState messageMap=%v dataSource=%v", kv.gid, kv.me, kv.shardkvClerks, kv.dataSource)
+		kv.seqId = seqId
+		kv.shards = shards
+		// update shards, so broad cast
+		kv.shardCond.L.Lock()
+		kv.shardCond.Broadcast()
+		kv.shardCond.L.Unlock()
+		DPrintf("[ShardKV-%d-%d] readKVState seqId=%d kv.shards=%v messageMap=%v dataSource=%v", kv.gid, kv.me, kv.seqId, shards, kv.shardkvClerks, kv.dataSource)
 		kv.mu.Unlock()
 	}
 }
@@ -266,8 +278,10 @@ func (kv *ShardKV) saveKVState(index int) {
 	e.Encode(cks)
 	e.Encode(kv.dataSource)
 	e.Encode(kv.clerkId)
+	e.Encode(kv.seqId)
+	e.Encode(kv.shards)
 	kv.rf.Snapshot(index, w.Bytes())
-	DPrintf("[ShardKV-%d-%d] Size=%d", kv.gid, kv.me, kv.persister.RaftStateSize())
+	DPrintf("[ShardKV-%d-%d] seqId=%d, Size=%d, Shards=%v", kv.gid, kv.me, kv.seqId, kv.persister.RaftStateSize(), kv.shards)
 }
 
 // read kv state and raft snapshot
@@ -284,7 +298,7 @@ func (kv *ShardKV) Kill() {
 	// Your code here, if desired.
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	DPrintf("%d Received Kill Command, logsize=%d, kv data=%v", kv.me, kv.persister.RaftStateSize(), kv.dataSource)
+	DPrintf("[ShardKV-%d-%d] Received Kill Command, Shards=%v logsize=%d, kv data=%v", kv.gid, kv.me, kv.shards, kv.persister.RaftStateSize(), kv.dataSource)
 }
 
 func (kv *ShardKV) processMsg() {
@@ -315,7 +329,7 @@ func (kv *ShardKV) processMsg() {
 		}
 
 		if Msg.SeqId < ck.seqId {
-			DPrintf("[ShardKV-%d-%d] Ignore Msg %v,  Msg.SeqId < ck.seqId", kv.gid, kv.me, applyMsg)
+			DPrintf("[ShardKV-%d-%d] Ignore Msg %v,  Msg.SeqId < ck.seqId=%d", kv.gid, kv.me, applyMsg, ck.seqId)
 			kv.mu.Unlock()
 			continue
 		}
@@ -334,9 +348,10 @@ func (kv *ShardKV) processMsg() {
 			kv.shardJoin(Msg.Shards, Msg.ShardData)
 		case "ShardLeave":
 			DPrintf("[ShardKV-%d-%d] Excute CkId=%d ShardLeave Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
-			kv.ShardLeave(Msg.Shards, Msg.SeqId)
+			kv.shardLeave(Msg.Shards, Msg.SeqId)
 		}
 		ck.seqId = Msg.SeqId + 1
+		kv.saveKVState(applyMsg.CommandIndex - 1)
 		kv.mu.Unlock()
 	}
 }
@@ -357,7 +372,10 @@ func (kv *ShardKV) shardJoin(shards []int, shardData map[string]string) {
 	kv.shardCond.Broadcast()
 }
 
-func (kv *ShardKV) ShardLeave(shards []int, seqId int) {
+func (kv *ShardKV) shardLeave(shards []int, seqId int) {
+	if kv.seqId == seqId + 1 {
+		return
+	}
 	// update seqid meaning this shard leave finish
 	kv.seqId = seqId + 1
 	// update shards, only update the leave shard , the join shard need to update by msg from the channel
@@ -454,8 +472,10 @@ func (kv *ShardKV) invokeMoveShard(shards []int, servers []string) {
 					Command: "ShardLeave",
 					SeqId:   args.SeqId,
 					Shards:  args.Shards,
+					ClerkId: args.ClerkId,
 				})
-				break
+				kv.shardLeave(shards, kv.seqId)
+				return
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -488,8 +508,8 @@ func (kv *ShardKV) removeShard(shard int) {
 func (kv *ShardKV) intervalQueryConfig() {
 	queryInterval := 100 * time.Millisecond
 	for {
-		kv.mu.Lock()
 		config := kv.mck.Query(-1)
+		kv.mu.Lock()
 		kvShards := make([]int, 0)
 		// collect group shards
 		for index, gid := range config.Shards {
@@ -581,16 +601,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.shardCond = sync.Cond{L: &sync.Mutex{}}
 	kv.clerkId = nrand()
 	kv.persister = persister
-
-	// init shards
-	config := kv.mck.Query(-1)
-	DPrintf("[ShardKV-%d-%d] query config=%v", kv.gid, kv.me, config)
-	// collect group shards
-	for index, gid := range config.Shards {
-		if gid == kv.gid {
-			kv.shards = append(kv.shards, index)
-		}
-	}
 
 	DPrintf("[ShardKV-%d-%d] Starting ... ClerkId=%d", kv.gid, kv.me, kv.clerkId)
 	kv.readState()

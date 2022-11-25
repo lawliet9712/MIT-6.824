@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"math/big"
 	"time"
+	"sync"
 
 	"6.824/labrpc"
 )
@@ -17,6 +18,7 @@ type Clerk struct {
 	// Your data here.
 	ckId  int64
 	seqId int
+	mu    sync.Mutex
 }
 
 func nrand() int64 {
@@ -42,6 +44,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
 	// Your code here.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
 	args.Num = num
 	args.CkId = ck.ckId
 	args.SeqId = ck.allocSeqId()
@@ -62,6 +66,8 @@ func (ck *Clerk) Query(num int) Config {
 func (ck *Clerk) Join(servers map[int][]string) {
 	args := &JoinArgs{}
 	// Your code here.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
 	args.Servers = servers
 	args.CkId = ck.ckId
 	args.SeqId = ck.allocSeqId()
@@ -81,6 +87,8 @@ func (ck *Clerk) Join(servers map[int][]string) {
 func (ck *Clerk) Leave(gids []int) {
 	args := &LeaveArgs{}
 	// Your code here.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
 	args.GIDs = gids
 	args.SeqId = ck.allocSeqId()
 	args.CkId = ck.ckId
@@ -100,6 +108,8 @@ func (ck *Clerk) Leave(gids []int) {
 func (ck *Clerk) Move(shard int, gid int) {
 	args := &MoveArgs{}
 	// Your code here.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
 	args.Shard = shard
 	args.GID = gid
 	args.SeqId = ck.allocSeqId()
