@@ -36,8 +36,18 @@ type Op struct {
 
 type ShardKVClerk struct {
 	seqId       int
-	messageCh   chan Op
+	messageCh   chan Notify
 	msgUniqueId int
+}
+
+type Notify struct {
+	Msg    Op
+	Result Err
+}
+
+type ShardContainer struct {
+	retainShards   []int
+	transferShards []int
 }
 
 type ShardKV struct {
@@ -55,41 +65,52 @@ type ShardKV struct {
 	shardkvClerks map[int64]*ShardKVClerk // ckid to ck
 	mck           *shardctrler.Clerk      // clerk
 	shards        []int                   // this group hold shards
-	shardCond     sync.Cond               // condition vari, before shard move done , all request will wait here
 	clerkId       int64                   // uid for move shard
 	seqId         int                     // seq id for prevent repeat move shard
 	persister     *raft.Persister
 }
 
-func (kv *ShardKV) WaitApplyMsgByCh(ch chan Op, ck *ShardKVClerk) (Op, Err) {
+func (kv *ShardKV) WaitApplyMsgByCh(ch chan Notify, ck *ShardKVClerk) Notify {
 	startTerm, _ := kv.rf.GetState()
 	timer := time.NewTimer(500 * time.Millisecond)
 	for {
 		select {
-		case Msg := <-ch:
-			return Msg, OK
+		case notify := <-ch:
+			return notify
 		case <-timer.C:
 			curTerm, isLeader := kv.rf.GetState()
 			if curTerm != startTerm || !isLeader {
 				kv.mu.Lock()
 				ck.msgUniqueId = 0
 				kv.mu.Unlock()
-				return Op{}, ErrWrongLeader
+				return Notify{Result: ErrWrongLeader}
 			}
 			timer.Reset(500 * time.Millisecond)
 		}
 	}
 }
 
-func (kv *ShardKV) NotifyApplyMsgByCh(ch chan Op, Msg Op) {
+func (kv *ShardKV) NotifyApplyMsgByCh(ch chan Notify, Msg Op) {
 	// we wait 200ms
 	// if notify timeout, then we ignore, because client probably send request to anthor server
+	result := OK
+	// check shard is already move ?
+	if Msg.Command == "Get" || Msg.Command == "Put" || Msg.Command == "Append" {
+		if !isShardInGroup(key2shard(Msg.Key), kv.shards) {
+			result = ErrWrongGroup
+		}
+	}
+	notify := Notify{
+		Result: Err(result),
+		Msg:    Msg,
+	}
 	timer := time.NewTimer(200 * time.Millisecond)
 	select {
-	case ch <- Msg:
+	case ch <- notify:
+		DPrintf("[ShardKV-%d-%d] NotifyApplyMsgByCh kv.shards=%v, key2shard(Msg.Key)=%d Notify=%v", kv.gid, kv.me, kv.shards, key2shard(Msg.Key), notify)
 		return
 	case <-timer.C:
-		DPrintf("[ShardKV-%d-%d] NotifyApplyMsgByCh Msg=%v, timeout", kv.gid, kv.me, Msg)
+		DPrintf("[ShardKV-%d-%d] NotifyApplyMsgByCh Notify=%v, timeout", kv.gid, kv.me, notify)
 		return
 	}
 }
@@ -99,7 +120,7 @@ func (kv *ShardKV) GetCk(ckId int64) *ShardKVClerk {
 	if !found {
 		ck = new(ShardKVClerk)
 		ck.seqId = 0
-		ck.messageCh = make(chan Op)
+		ck.messageCh = make(chan Notify)
 		kv.shardkvClerks[ckId] = ck
 		DPrintf("[ShardKV-%d-%d] Init ck %d", kv.gid, kv.me, ckId)
 	}
@@ -113,29 +134,31 @@ func (kv *ShardKV) GetCk(ckId int64) *ShardKVClerk {
 func (kv *ShardKV) isRequestKeyCorrect(key string) bool {
 	// check key belong shard still hold in this group ?
 	/*
-	
-	config := kv.mck.Query(-1)
-	for shard, gid := range config.Shards {
-		if shard == keyShard && gid != kv.gid {
-			DPrintf("[ShardKV-%d-%d] keyShard=%d not in this group, config=%v", kv.gid, kv.me, keyShard, config)
-			return false
-		}
-	}
 
-	// check shard in current config ?
-	kv.shardCond.L.Lock()
-	for {
-		kv.mu.Lock()
-		if isShardInGroup(keyShard, kv.shards) {
-			kv.mu.Unlock()
-			break
+		config := kv.mck.Query(-1)
+		for shard, gid := range config.Shards {
+			if shard == keyShard && gid != kv.gid {
+				DPrintf("[ShardKV-%d-%d] keyShard=%d not in this group, config=%v", kv.gid, kv.me, keyShard, config)
+				return false
+			}
 		}
-		DPrintf("[ShardKV-%d-%d] not found keyshard=%d in kv.shards=%v", kv.gid, kv.me, keyShard, kv.shards)
-		kv.mu.Unlock()
-		kv.shardCond.Wait()
-	}
-	kv.shardCond.L.Unlock()
+
+		// check shard in current config ?
+		kv.shardCond.L.Lock()
+		for {
+			kv.mu.Lock()
+			if isShardInGroup(keyShard, kv.shards) {
+				kv.mu.Unlock()
+				break
+			}
+			DPrintf("[ShardKV-%d-%d] not found keyshard=%d in kv.shards=%v", kv.gid, kv.me, keyShard, kv.shards)
+			kv.mu.Unlock()
+			kv.shardCond.Wait()
+		}
+		kv.shardCond.L.Unlock()
 	*/
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	keyShard := key2shard(key)
 	return isShardInGroup(keyShard, kv.shards)
 	//return true
@@ -168,12 +191,13 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	ck.msgUniqueId = logIndex
 	kv.mu.Unlock()
 	// step 2 : parse op struct
-	getMsg, err := kv.WaitApplyMsgByCh(ck.messageCh, ck)
+	notify := kv.WaitApplyMsgByCh(ck.messageCh, ck)
+	getMsg := notify.Msg
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	DPrintf("[ShardKV-%d-%d] Received Msg [Get] args=%v, SeqId=%d, Msg=%v", kv.gid, kv.me, args, args.SeqId, getMsg)
-	reply.Err = err
-	if err != OK {
+	reply.Err = notify.Result
+	if reply.Err != OK {
 		// leadership change, return ErrWrongLeader
 		return
 	}
@@ -216,12 +240,12 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Unlock()
 	// step 2 : wait the channel
 	reply.Err = OK
-	Msg, err := kv.WaitApplyMsgByCh(ck.messageCh, ck)
+	notify := kv.WaitApplyMsgByCh(ck.messageCh, ck)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	DPrintf("[ShardKV-%d-%d] Recived Msg [PutAppend] from ck.putAppendCh args=%v, SeqId=%d, Msg=%v", kv.gid, kv.me, args, args.SeqId, Msg)
-	reply.Err = err
-	if err != OK {
+	DPrintf("[ShardKV-%d-%d] Recived Msg [PutAppend] from ck.putAppendCh args=%v, SeqId=%d, Msg=%v", kv.gid, kv.me, args, args.SeqId, notify.Msg)
+	reply.Err = notify.Result
+	if reply.Err != OK {
 		DPrintf("[ShardKV-%d-%d] leader change args=%v, SeqId=%d", kv.gid, kv.me, args, args.SeqId)
 		return
 	}
@@ -239,12 +263,12 @@ func (kv *ShardKV) readKVState(data []byte) {
 	dataSource := make(map[string]string)
 	shards := make([]int, 0)
 	var clerkId int64
-	var seqId   int
+	var seqId int
 	//var commitIndex int
 	if d.Decode(&cks) != nil ||
 		d.Decode(&dataSource) != nil ||
-		d.Decode(&clerkId) != nil || 
-		d.Decode(&seqId) != nil || 
+		d.Decode(&clerkId) != nil ||
+		d.Decode(&seqId) != nil ||
 		d.Decode(&shards) != nil {
 		DPrintf("[readKVState] decode failed ...")
 	} else {
@@ -259,16 +283,16 @@ func (kv *ShardKV) readKVState(data []byte) {
 		kv.clerkId = clerkId
 		kv.seqId = seqId
 		kv.shards = shards
-		// update shards, so broad cast
-		kv.shardCond.L.Lock()
-		kv.shardCond.Broadcast()
-		kv.shardCond.L.Unlock()
 		DPrintf("[ShardKV-%d-%d] readKVState seqId=%d kv.shards=%v messageMap=%v dataSource=%v", kv.gid, kv.me, kv.seqId, shards, kv.shardkvClerks, kv.dataSource)
 		kv.mu.Unlock()
 	}
 }
 
 func (kv *ShardKV) saveKVState(index int) {
+	if kv.maxraftstate == -1 {
+		return
+	}
+
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	cks := make(map[int64]int)
@@ -282,6 +306,21 @@ func (kv *ShardKV) saveKVState(index int) {
 	e.Encode(kv.shards)
 	kv.rf.Snapshot(index, w.Bytes())
 	DPrintf("[ShardKV-%d-%d] seqId=%d, Size=%d, Shards=%v", kv.gid, kv.me, kv.seqId, kv.persister.RaftStateSize(), kv.shards)
+}
+
+func (kv *ShardKV) persist() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	cks := make(map[int64]int)
+	for ckId, ck := range kv.shardkvClerks {
+		cks[ckId] = ck.seqId
+	}
+	e.Encode(cks)
+	e.Encode(kv.dataSource)
+	e.Encode(kv.clerkId)
+	e.Encode(kv.seqId)
+	e.Encode(kv.shards)
+	kv.persister.SaveSnapshot(w.Bytes())
 }
 
 // read kv state and raft snapshot
@@ -301,65 +340,65 @@ func (kv *ShardKV) Kill() {
 	DPrintf("[ShardKV-%d-%d] Received Kill Command, Shards=%v logsize=%d, kv data=%v", kv.gid, kv.me, kv.shards, kv.persister.RaftStateSize(), kv.dataSource)
 }
 
-func (kv *ShardKV) processMsg() {
+func (kv *ShardKV) recvMsg() {
 	for {
 		applyMsg := <-kv.applyCh
-		if applyMsg.SnapshotValid {
-			kv.readKVState(applyMsg.Snapshot)
-			continue
-		}
-		Msg := applyMsg.Command.(Op)
-		DPrintf("[ShardKV-%d-%d] Received Msg from channel. Msg=%v", kv.gid, kv.me, applyMsg)
-
-		kv.mu.Lock()
-		if kv.needSnapshot() {
-			DPrintf("[ShardKV-%d-%d] size=%d, maxsize=%d, DoSnapshot %v", kv.gid, kv.me, kv.persister.RaftStateSize(), kv.maxraftstate, applyMsg)
-			kv.saveKVState(applyMsg.CommandIndex - 1)
-		}
-
-		ck := kv.GetCk(Msg.ClerkId)
-
-		_, isLeader := kv.rf.GetState()
-		needNotify := ck.msgUniqueId == applyMsg.CommandIndex
-		if isLeader && needNotify {
-			ck.msgUniqueId = 0
-			DPrintf("[ShardKV-%d-%d] Process Msg %v finish, ready send to ck.Ch, SeqId=%d isLeader=%v", kv.gid, kv.me, applyMsg, ck.seqId, isLeader)
-			kv.NotifyApplyMsgByCh(ck.messageCh, Msg)
-			DPrintf("[ShardKV-%d-%d] Process Msg %v Send to Rpc handler finish SeqId=%d isLeader=%v", kv.gid, kv.me, applyMsg, ck.seqId, isLeader)
-		}
-
-		if Msg.SeqId < ck.seqId {
-			DPrintf("[ShardKV-%d-%d] Ignore Msg %v,  Msg.SeqId < ck.seqId=%d", kv.gid, kv.me, applyMsg, ck.seqId)
-			kv.mu.Unlock()
-			continue
-		}
-
-		switch Msg.Command {
-		case "Put":
-			kv.dataSource[Msg.Key] = Msg.Value
-			DPrintf("[ShardKV-%d-%d] Excute CkId=%d Put Msg=%v, kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
-		case "Append":
-			DPrintf("[ShardKV-%d-%d] Excute CkId=%d Append Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
-			kv.dataSource[Msg.Key] += Msg.Value
-		case "Get":
-			DPrintf("[ShardKV-%d-%d] Excute CkId=%d Get Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
-		case "ShardMove":
-			DPrintf("[ShardKV-%d-%d] Excute CkId=%d ShardJoin Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
-			kv.shardJoin(Msg.Shards, Msg.ShardData)
-		case "ShardLeave":
-			DPrintf("[ShardKV-%d-%d] Excute CkId=%d ShardLeave Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
-			kv.shardLeave(Msg.Shards, Msg.SeqId)
-		}
-		ck.seqId = Msg.SeqId + 1
-		kv.saveKVState(applyMsg.CommandIndex - 1)
-		kv.mu.Unlock()
+		kv.processMsg(applyMsg)
 	}
+}
+
+func (kv *ShardKV) processMsg(applyMsg raft.ApplyMsg) {
+	if applyMsg.SnapshotValid {
+		kv.readKVState(applyMsg.Snapshot)
+		return
+	}
+	Msg := applyMsg.Command.(Op)
+	DPrintf("[ShardKV-%d-%d] Received Msg from channel. Msg=%v", kv.gid, kv.me, applyMsg)
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if kv.needSnapshot() {
+		DPrintf("[ShardKV-%d-%d] size=%d, maxsize=%d, DoSnapshot %v", kv.gid, kv.me, kv.persister.RaftStateSize(), kv.maxraftstate, applyMsg)
+		kv.saveKVState(applyMsg.CommandIndex - 1)
+	}
+
+	ck := kv.GetCk(Msg.ClerkId)
+	_, isLeader := kv.rf.GetState()
+	needNotify := ck.msgUniqueId == applyMsg.CommandIndex
+	if isLeader && needNotify {
+		ck.msgUniqueId = 0
+		DPrintf("[ShardKV-%d-%d] Process Msg %v finish, ready send to ck.Ch, SeqId=%d isLeader=%v", kv.gid, kv.me, applyMsg, ck.seqId, isLeader)
+		kv.NotifyApplyMsgByCh(ck.messageCh, Msg)
+		DPrintf("[ShardKV-%d-%d] Process Msg %v Send to Rpc handler finish SeqId=%d isLeader=%v", kv.gid, kv.me, applyMsg, ck.seqId, isLeader)
+	}
+
+	if Msg.SeqId < ck.seqId {
+		DPrintf("[ShardKV-%d-%d] Ignore Msg %v,  Msg.SeqId < ck.seqId=%d", kv.gid, kv.me, applyMsg, ck.seqId)
+		return
+	}
+
+	switch Msg.Command {
+	case "Put":
+		kv.dataSource[Msg.Key] = Msg.Value
+		DPrintf("[ShardKV-%d-%d] Excute CkId=%d Put Msg=%v, kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
+	case "Append":
+		DPrintf("[ShardKV-%d-%d] Excute CkId=%d Append Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
+		kv.dataSource[Msg.Key] += Msg.Value
+	case "Get":
+		DPrintf("[ShardKV-%d-%d] Excute CkId=%d Get Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
+	case "ShardMove":
+		DPrintf("[ShardKV-%d-%d] Excute CkId=%d ShardJoin Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
+		kv.shardJoin(Msg.Shards, Msg.ShardData)
+	case "ShardLeave":
+		DPrintf("[ShardKV-%d-%d] Excute CkId=%d ShardLeave Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
+		kv.shardLeave(Msg.Shards, Msg.SeqId)
+	}
+	ck.seqId = Msg.SeqId + 1
+	kv.persist()
 }
 
 func (kv *ShardKV) shardJoin(shards []int, shardData map[string]string) {
 	// just put it in
-	kv.shardCond.L.Lock()
-	defer kv.shardCond.L.Unlock()
 	DPrintf("[ShardKV-%d-%d] Excute shardJoin, new shards=%v, ShardData=%v", kv.gid, kv.me, shards, shardData)
 	for key, value := range shardData {
 		kv.dataSource[key] = value
@@ -368,12 +407,10 @@ func (kv *ShardKV) shardJoin(shards []int, shardData map[string]string) {
 	for _, shard := range shards {
 		kv.addShard(shard)
 	}
-	// broad cast all request continue
-	kv.shardCond.Broadcast()
 }
 
 func (kv *ShardKV) shardLeave(shards []int, seqId int) {
-	if kv.seqId == seqId + 1 {
+	if kv.seqId == seqId+1 {
 		return
 	}
 	// update seqid meaning this shard leave finish
@@ -431,12 +468,12 @@ func (kv *ShardKV) MoveShard(args *RequestMoveShard, reply *ReplyMoveShard) {
 	kv.mu.Unlock()
 	// step 2 : wait the channel
 	reply.Err = OK
-	Msg, err := kv.WaitApplyMsgByCh(ck.messageCh, ck)
+	notify := kv.WaitApplyMsgByCh(ck.messageCh, ck)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	DPrintf("[ShardKV-%d-%d] Recived Msg [MoveShard] from ck.channel args=%v, SeqId=%d, Msg=%v", kv.gid, kv.me, args, args.SeqId, Msg)
-	reply.Err = err
-	if err != OK {
+	DPrintf("[ShardKV-%d-%d] Recived Msg [MoveShard] from ck.channel args=%v, SeqId=%d, Msg=%v", kv.gid, kv.me, args, args.SeqId, notify.Msg)
+	reply.Err = notify.Result
+	if reply.Err != OK {
 		DPrintf("[ShardKV-%d-%d] leader change args=%v, SeqId=%d", kv.gid, kv.me, args, args.SeqId)
 		return
 	}
@@ -530,7 +567,8 @@ func (kv *ShardKV) intervalQueryConfig() {
 		}
 		DPrintf("[ShardKV-%d-%d] groupNewShards=%v, OldShards=%v, leaveShards=%v query config=%v", kv.gid, kv.me, kvShards, kv.shards, leaveShards, config)
 		// init config
-		if config.Num == 1 {
+		if len(kv.dataSource) == 0 && kv.persister.SnapshotSize() == 0 {
+			DPrintf("[ShardKV-%d-%d] init shards=%v,  query config=%v", kv.gid, kv.me, kv.shards, config)
 			kv.shards = kvShards
 		}
 
@@ -551,6 +589,21 @@ func (kv *ShardKV) sendRequestMoveShard(servername string, args *RequestMoveShar
 	srv := kv.make_end(servername)
 	ok := srv.Call("ShardKV.MoveShard", args, reply)
 	return ok
+}
+
+// when shard kv restart , clean channel remain msg then start
+func (kv *ShardKV) cleanChannelRemainMsg() {
+	timer := time.NewTimer(1000 * time.Millisecond)
+	for {
+		select {
+		case applyMsg := <-kv.applyCh:
+			timer.Reset(1000 * time.Millisecond)
+			kv.processMsg(applyMsg)
+		case <-timer.C:
+			return
+		}
+
+	}
 }
 
 // servers[] contains the ports of the servers in this group.
@@ -593,18 +646,19 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	// Your initialization code here.
 	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 1000)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.dataSource = make(map[string]string)
 	kv.shardkvClerks = make(map[int64]*ShardKVClerk)
 	kv.shards = make([]int, 0)
-	kv.shardCond = sync.Cond{L: &sync.Mutex{}}
 	kv.clerkId = nrand()
 	kv.persister = persister
 
 	DPrintf("[ShardKV-%d-%d] Starting ... ClerkId=%d", kv.gid, kv.me, kv.clerkId)
 	kv.readState()
-	go kv.processMsg()
+	kv.cleanChannelRemainMsg()
+	DPrintf("[ShardKV-%d-%d] clean channel msg finish ...", kv.gid, kv.me)
+	go kv.recvMsg()
 	go kv.intervalQueryConfig()
 	return kv
 }

@@ -74,3 +74,9 @@ func (ps *Persister) SnapshotSize() int {
 	defer ps.mu.Unlock()
 	return len(ps.snapshot)
 }
+
+func (ps *Persister) SaveSnapshot(snapshot []byte) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	ps.snapshot = clone(snapshot)
+}
