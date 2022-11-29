@@ -594,7 +594,6 @@ func (kv *ShardKV) intervalQueryConfig() {
 
 		_, isLeader := kv.rf.GetState()
 		if isLeader {
-			kv.rf.Start()
 			// move the shard, just notify, current not need to change self anything
 			for gid, shards := range leaveShards {
 				kv.invokeMoveShard(shards, config.Groups[gid])
