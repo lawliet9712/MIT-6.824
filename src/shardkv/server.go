@@ -48,6 +48,19 @@ type Notify struct {
 type ShardContainer struct {
 	retainShards   []int
 	transferShards []int
+	configNum 	   int
+}
+
+type BeginMoveShard struct {
+	Shards []int // group to shards
+	Gid int
+	ConfigNum int
+}
+
+type EndMoveShard struct {
+	Shards []int // group to shards
+	Gid int
+	ConfigNum int
 }
 
 type ShardKV struct {
@@ -64,7 +77,7 @@ type ShardKV struct {
 	dataSource    map[string]string       // db
 	shardkvClerks map[int64]*ShardKVClerk // ckid to ck
 	mck           *shardctrler.Clerk      // clerk
-	shards        []int                   // this group hold shards
+	shards        ShardContainer                   // this group hold shards
 	clerkId       int64                   // uid for move shard
 	seqId         int                     // seq id for prevent repeat move shard
 	persister     *raft.Persister
@@ -96,7 +109,7 @@ func (kv *ShardKV) NotifyApplyMsgByCh(ch chan Notify, Msg Op) {
 	result := OK
 	// check shard is already move ?
 	if Msg.Command == "Get" || Msg.Command == "Put" || Msg.Command == "Append" {
-		if !isShardInGroup(key2shard(Msg.Key), kv.shards) {
+		if !isShardInGroup(key2shard(Msg.Key), kv.shards.retainShards) {
 			result = ErrWrongGroup
 		}
 	}
@@ -160,7 +173,9 @@ func (kv *ShardKV) isRequestKeyCorrect(key string) bool {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	keyShard := key2shard(key)
-	return isShardInGroup(keyShard, kv.shards)
+	// check shard is transfering 
+	isShardTransfering := isShardInGroup(keyShard, kv.shards.transferShards)
+	return isShardInGroup(keyShard, kv.shards.retainShards) && !isShardTransfering
 	//return true
 }
 
@@ -261,7 +276,11 @@ func (kv *ShardKV) readKVState(data []byte) {
 	d := labgob.NewDecoder(r)
 	cks := make(map[int64]int)
 	dataSource := make(map[string]string)
-	shards := make([]int, 0)
+	shards := ShardContainer {
+		transferShards: make([]int, 0),
+		retainShards: make([]int, 0),
+		configNum: -1,
+	}
 	var clerkId int64
 	var seqId int
 	//var commitIndex int
@@ -445,7 +464,7 @@ func (kv *ShardKV) needSnapshot() bool {
 /*
 rpc handler
 */
-func (kv *ShardKV) MoveShard(args *RequestMoveShard, reply *ReplyMoveShard) {
+func (kv *ShardKV) RequestMoveShard(args *RequestMoveShard, reply *ReplyMoveShard) {
 	kv.mu.Lock()
 	DPrintf("[ShardKV-%d-%d] Received Req MoveShard %v, SeqId=%d ", kv.gid, kv.me, args, args.SeqId)
 	// start a command
@@ -521,22 +540,22 @@ func (kv *ShardKV) invokeMoveShard(shards []int, servers []string) {
 
 func (kv *ShardKV) addShard(shard int) {
 	alreadExist := false
-	for _, curShard := range kv.shards {
+	for _, curShard := range kv.shards.retainShards {
 		if curShard == shard {
 			alreadExist = true
 		}
 	}
 	if !alreadExist {
-		kv.shards = append(kv.shards, shard)
+		kv.shards.retainShards = append(kv.shards.retainShards, shard)
 	} else {
 		DPrintf("[ShardKV-%d-%d] add shard failed, shard=%d alreadyExsit in %v", kv.gid, kv.me, shard, kv.shards)
 	}
 }
 
 func (kv *ShardKV) removeShard(shard int) {
-	for i := 0; i < len(kv.shards); i++ {
-		if kv.shards[i] == shard {
-			kv.shards = append(kv.shards[:i], kv.shards[i+1:]...)
+	for i := 0; i < len(kv.shards.retainShards); i++ {
+		if kv.shards.retainShards[i] == shard {
+			kv.shards.retainShards = append(kv.shards.retainShards[:i], kv.shards.retainShards[i+1:]...)
 			i-- // maintain the correct index
 		}
 	}
@@ -547,6 +566,12 @@ func (kv *ShardKV) intervalQueryConfig() {
 	for {
 		config := kv.mck.Query(-1)
 		kv.mu.Lock()
+		if config.Num == kv.shards.configNum {
+			kv.mu.Unlock()
+			continue
+		}
+
+		kv.shards.configNum = config.Num
 		kvShards := make([]int, 0)
 		// collect group shards
 		for index, gid := range config.Shards {
@@ -556,7 +581,7 @@ func (kv *ShardKV) intervalQueryConfig() {
 		}
 		// find the shard that leave this group
 		leaveShards := make(map[int][]int) // shard idx to new gid
-		for _, shard := range kv.shards {
+		for _, shard := range kv.shards.retainShards {
 			if !isShardInGroup(shard, kvShards) {
 				shardNewGroup := config.Shards[shard]
 				if _, found := leaveShards[shardNewGroup]; !found {
@@ -566,14 +591,10 @@ func (kv *ShardKV) intervalQueryConfig() {
 			}
 		}
 		DPrintf("[ShardKV-%d-%d] groupNewShards=%v, OldShards=%v, leaveShards=%v query config=%v", kv.gid, kv.me, kvShards, kv.shards, leaveShards, config)
-		// init config
-		if len(kv.dataSource) == 0 && kv.persister.SnapshotSize() == 0 {
-			DPrintf("[ShardKV-%d-%d] init shards=%v,  query config=%v", kv.gid, kv.me, kv.shards, config)
-			kv.shards = kvShards
-		}
 
 		_, isLeader := kv.rf.GetState()
 		if isLeader {
+			kv.rf.Start()
 			// move the shard, just notify, current not need to change self anything
 			for gid, shards := range leaveShards {
 				kv.invokeMoveShard(shards, config.Groups[gid])
@@ -587,7 +608,7 @@ func (kv *ShardKV) intervalQueryConfig() {
 
 func (kv *ShardKV) sendRequestMoveShard(servername string, args *RequestMoveShard, reply *ReplyMoveShard) bool {
 	srv := kv.make_end(servername)
-	ok := srv.Call("ShardKV.MoveShard", args, reply)
+	ok := srv.Call("ShardKV.RequestMoveShard", args, reply)
 	return ok
 }
 
@@ -650,7 +671,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.dataSource = make(map[string]string)
 	kv.shardkvClerks = make(map[int64]*ShardKVClerk)
-	kv.shards = make([]int, 0)
+	kv.shards = ShardContainer{
+		retainShards: make([]int, 0),
+		transferShards: make([]int, 0),
+		configNum: -1,
+	}
 	kv.clerkId = nrand()
 	kv.persister = persister
 
