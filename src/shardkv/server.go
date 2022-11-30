@@ -25,13 +25,13 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Key       string
-	Value     string
-	Command   string
-	ClerkId   int64
-	SeqId     int
-	Shards    []int // move shard rpc
-	ShardData map[string]string
+	Key     string
+	Value   string
+	Command string
+	ClerkId int64
+	SeqId   int
+	LeaveOp ShardLeaveOp
+	JoinOp  ShardJoinOp
 }
 
 type ShardKVClerk struct {
@@ -48,19 +48,17 @@ type Notify struct {
 type ShardContainer struct {
 	retainShards   []int
 	transferShards []int
-	configNum 	   int
+	configNum      int
 }
 
-type BeginMoveShard struct {
-	Shards []int // group to shards
-	Gid int
-	ConfigNum int
+type ShardLeaveOp struct {
+	Shards  map[int][]int //
+	Servers map[int][]string
 }
 
-type EndMoveShard struct {
-	Shards []int // group to shards
-	Gid int
-	ConfigNum int
+type ShardJoinOp struct {
+	Shards    []int // move shard rpc
+	ShardData map[string]string
 }
 
 type ShardKV struct {
@@ -77,7 +75,7 @@ type ShardKV struct {
 	dataSource    map[string]string       // db
 	shardkvClerks map[int64]*ShardKVClerk // ckid to ck
 	mck           *shardctrler.Clerk      // clerk
-	shards        ShardContainer                   // this group hold shards
+	shards        ShardContainer          // this group hold shards
 	clerkId       int64                   // uid for move shard
 	seqId         int                     // seq id for prevent repeat move shard
 	persister     *raft.Persister
@@ -173,7 +171,7 @@ func (kv *ShardKV) isRequestKeyCorrect(key string) bool {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	keyShard := key2shard(key)
-	// check shard is transfering 
+	// check shard is transfering
 	isShardTransfering := isShardInGroup(keyShard, kv.shards.transferShards)
 	return isShardInGroup(keyShard, kv.shards.retainShards) && !isShardTransfering
 	//return true
@@ -276,10 +274,10 @@ func (kv *ShardKV) readKVState(data []byte) {
 	d := labgob.NewDecoder(r)
 	cks := make(map[int64]int)
 	dataSource := make(map[string]string)
-	shards := ShardContainer {
+	shards := ShardContainer{
 		transferShards: make([]int, 0),
-		retainShards: make([]int, 0),
-		configNum: -1,
+		retainShards:   make([]int, 0),
+		configNum:      -1,
 	}
 	var clerkId int64
 	var seqId int
@@ -405,12 +403,15 @@ func (kv *ShardKV) processMsg(applyMsg raft.ApplyMsg) {
 		kv.dataSource[Msg.Key] += Msg.Value
 	case "Get":
 		DPrintf("[ShardKV-%d-%d] Excute CkId=%d Get Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
-	case "ShardMove":
+	case "ShardJoin":
 		DPrintf("[ShardKV-%d-%d] Excute CkId=%d ShardJoin Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
-		kv.shardJoin(Msg.Shards, Msg.ShardData)
-	case "ShardLeave":
+		kv.shardJoin(Msg.JoinOp.Shards, Msg.JoinOp.ShardData)
+	case "BeginShardLeave":
 		DPrintf("[ShardKV-%d-%d] Excute CkId=%d ShardLeave Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
-		kv.shardLeave(Msg.Shards, Msg.SeqId)
+		kv.beginShardLeave(Msg.LeaveOp)
+	case "EndShardLeave":
+		DPrintf("[ShardKV-%d-%d] Excute CkId=%d ShardLeave Msg=%v kvdata=%v", kv.gid, kv.me, Msg.ClerkId, applyMsg, kv.dataSource)
+		kv.endShardLeave(Msg.LeaveOp)
 	}
 	ck.seqId = Msg.SeqId + 1
 	kv.persist()
@@ -428,17 +429,71 @@ func (kv *ShardKV) shardJoin(shards []int, shardData map[string]string) {
 	}
 }
 
-func (kv *ShardKV) shardLeave(shards []int, seqId int) {
-	if kv.seqId == seqId+1 {
-		return
+func (kv *ShardKV) oneShardLeave(shards []int, servers []string) bool {
+	data := make(map[string]string)
+	for _, moveShard := range shards {
+		for key, value := range kv.dataSource {
+			if key2shard(key) != moveShard {
+				continue
+			}
+			data[key] = value
+		}
 	}
-	// update seqid meaning this shard leave finish
-	kv.seqId = seqId + 1
-	// update shards, only update the leave shard , the join shard need to update by msg from the channel
-	for _, shard := range shards {
-		kv.removeShard(shard)
+	DPrintf("[ShardKV-%d-%d] invokeMoveShard shards=%v, data=%v", kv.gid, kv.me, shards, data)
+	// notify shard new owner
+	args := RequestMoveShard{
+		Data:    data,
+		SeqId:   kv.seqId,
+		ClerkId: kv.clerkId,
+		Shards:  shards,
 	}
-	DPrintf("[ShardKV-%d-%d] Excute ShardLeave, leave shards=%v, kv.Shards=%v", kv.gid, kv.me, shards, kv.shards)
+	reply := ReplyMoveShard{}
+	// todo when all server access fail
+	for {
+		for _, servername := range servers {
+			DPrintf("[ShardKV-%d-%d] start move shard args=%v", kv.gid, kv.me, args)
+			ok := kv.sendRequestMoveShard(servername, &args, &reply)
+			if ok && reply.Err == OK {
+				DPrintf("[ShardKV-%d-%d] move shard finish ...", kv.gid, kv.me)
+				kv.rf.Start(Op{
+					Command: "EndShardLeave",
+					SeqId:   args.SeqId,
+					ClerkId: args.ClerkId,
+					LeaveOp: ShardLeaveOp{},
+				})
+				return true
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) beginShardLeave(leaveOp ShardLeaveOp) {
+	for gid, shards := range leaveOp.Shards {
+		servers := leaveOp.Servers[gid]
+		ok := kv.oneShardLeave(shards, servers)
+		if ok {
+			DPrintf("[ShardKV-%d-%d] beginShardLeave to %d succ", kv.gid, kv.me, gid)
+		} else {
+			DPrintf("[ShardKV-%d-%d] beginShardLeave to %d failed", kv.gid, kv.me, gid)
+		}
+	}
+	kv.rf.Start(Op{
+		ClerkId: kv.clerkId,
+		SeqId:   kv.seqId,
+		LeaveOp: leaveOp,
+	})
+}
+
+func (kv *ShardKV) endShardLeave(leaveOp ShardLeaveOp) {
+	// update shards, only update the leave shard , the join shard need to update by shardjoin msg from the channel
+	for gid, shards := range leaveOp.Shards {
+		for _, shard := range shards {
+			kv.removeShard(shard)
+		}
+		DPrintf("[ShardKV-%d-%d] endShardLeave, leave shards=%v, gid=%d", kv.gid, kv.me, shards, gid)
+	}
+	DPrintf("[ShardKV-%d-%d] Excute ShardLeave, leave shards=%v, kv.Shards=%v", kv.gid, kv.me, leaveOp, kv.shards)
 }
 
 /*
@@ -468,12 +523,15 @@ func (kv *ShardKV) RequestMoveShard(args *RequestMoveShard, reply *ReplyMoveShar
 	kv.mu.Lock()
 	DPrintf("[ShardKV-%d-%d] Received Req MoveShard %v, SeqId=%d ", kv.gid, kv.me, args, args.SeqId)
 	// start a command
-	logIndex, _, isLeader := kv.rf.Start(Op{
-		ShardData: args.Data,
-		Command:   "ShardMove",
-		ClerkId:   args.ClerkId, // special clerk id for indicate move shard
-		SeqId:     args.SeqId,
+	shardJoinOp := ShardJoinOp{
 		Shards:    args.Shards,
+		ShardData: args.Data,
+	}
+	logIndex, _, isLeader := kv.rf.Start(Op{
+		Command: "ShardMove",
+		ClerkId: args.ClerkId, // special clerk id for indicate move shard
+		SeqId:   args.SeqId,
+		JoinOp:  shardJoinOp,
 	})
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -495,46 +553,6 @@ func (kv *ShardKV) RequestMoveShard(args *RequestMoveShard, reply *ReplyMoveShar
 	if reply.Err != OK {
 		DPrintf("[ShardKV-%d-%d] leader change args=%v, SeqId=%d", kv.gid, kv.me, args, args.SeqId)
 		return
-	}
-}
-
-func (kv *ShardKV) invokeMoveShard(shards []int, servers []string) {
-	data := make(map[string]string)
-	for _, moveShard := range shards {
-		for key, value := range kv.dataSource {
-			if key2shard(key) != moveShard {
-				continue
-			}
-			data[key] = value
-		}
-	}
-	DPrintf("[ShardKV-%d-%d] invokeMoveShard shards=%v, data=%v", kv.gid, kv.me, shards, data)
-	// notify shard new owner
-	args := RequestMoveShard{
-		Data:    data,
-		SeqId:   kv.seqId,
-		ClerkId: kv.clerkId,
-		Shards:  shards,
-	}
-	reply := ReplyMoveShard{}
-	// todo when all server access fail
-	for {
-		for _, servername := range servers {
-			DPrintf("[ShardKV-%d-%d] start move shard args=%v", kv.gid, kv.me, args)
-			ok := kv.sendRequestMoveShard(servername, &args, &reply)
-			if ok && reply.Err == OK {
-				DPrintf("[ShardKV-%d-%d] move shard finish ...", kv.gid, kv.me)
-				kv.rf.Start(Op{
-					Command: "ShardLeave",
-					SeqId:   args.SeqId,
-					Shards:  args.Shards,
-					ClerkId: args.ClerkId,
-				})
-				kv.shardLeave(shards, kv.seqId)
-				return
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -595,9 +613,14 @@ func (kv *ShardKV) intervalQueryConfig() {
 		_, isLeader := kv.rf.GetState()
 		if isLeader {
 			// move the shard, just notify, current not need to change self anything
-			for gid, shards := range leaveShards {
-				kv.invokeMoveShard(shards, config.Groups[gid])
-			}
+			kv.rf.Start(Op{
+				ClerkId: kv.clerkId,
+				SeqId:   kv.seqId,
+				LeaveOp: ShardLeaveOp{
+					Shards:  leaveShards,
+					Servers: config.Groups,
+				},
+			})
 		}
 
 		kv.mu.Unlock()
@@ -671,9 +694,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.dataSource = make(map[string]string)
 	kv.shardkvClerks = make(map[int64]*ShardKVClerk)
 	kv.shards = ShardContainer{
-		retainShards: make([]int, 0),
+		retainShards:   make([]int, 0),
 		transferShards: make([]int, 0),
-		configNum: -1,
+		configNum:      -1,
 	}
 	kv.clerkId = nrand()
 	kv.persister = persister
