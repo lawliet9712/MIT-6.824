@@ -41,8 +41,8 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
-	ckId       int64
-	requestMap map[int]int // gid -> seqid
+	ckId  int64
+	seqId int
 }
 
 // the tester calls MakeClerk.
@@ -58,13 +58,12 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.make_end = make_end
 	// You'll have to add code here.
 	ck.ckId = nrand()
-	ck.requestMap = make(map[int]int)
 	return ck
 }
 
-func (ck *Clerk) allocSeqId(gid int) int {
-	ck.requestMap[gid] += 1
-	return ck.requestMap[gid]
+func (ck *Clerk) allocSeqId() int {
+	ck.seqId += 1
+	return ck.seqId
 }
 
 // fetch the current value for a key.
@@ -75,17 +74,11 @@ func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
 	args.ClerkId = ck.ckId
-	requestMap := make(map[int]int)
+	args.SeqId = ck.allocSeqId()
 
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
-		if seqId, found := requestMap[gid]; found {
-			args.SeqId = seqId
-		} else {
-			args.SeqId = ck.allocSeqId(gid)
-			requestMap[gid] = args.SeqId
-		}
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
@@ -115,17 +108,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Value = value
 	args.Op = op
 	args.ClerkId = ck.ckId
-	requestMap := make(map[int]int)
+	args.SeqId = ck.allocSeqId()
 
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
-		if seqId, found := requestMap[gid]; found {
-			args.SeqId = seqId
-		} else {
-			args.SeqId = ck.allocSeqId(gid)
-			requestMap[gid] = args.SeqId
-		}
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])

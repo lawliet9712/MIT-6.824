@@ -52,25 +52,27 @@ type ShardContainer struct {
 	TransferShards []int
 	WaitJoinShards []int
 	ConfigNum      int
-	ShardReqSeqId  int // for local start raft command 
-	ShardReqId     int64 // for local start a op 
+	QueryDone      bool
+	ShardReqSeqId  int   // for local start raft command
+	ShardReqId     int64 // for local start a op
 }
 
 type ShardLeaveOp struct {
-	LeaveShards  map[int][]int //
+	LeaveShards    map[int][]int //
 	WaitJoinShards []int
-	Servers map[int][]string
-	ConfigNum int
+	Servers        map[int][]string
+	ConfigNum      int
 }
 
 type ShardJoinOp struct {
-	Shards    []int // move shard rpc
-	ShardData map[string]string
-	ConfigNum int
+	Shards     []int // move shard rpc
+	ShardData  map[string]string
+	ConfigNum  int
+	RequestMap map[int64]int
 }
 
 type ShardInitOp struct {
-	Shards []int // init shards
+	Shards    []int // init shards
 	ConfigNum int
 }
 
@@ -269,7 +271,7 @@ func (kv *ShardKV) readKVState(data []byte) {
 	shards := ShardContainer{
 		TransferShards: make([]int, 0),
 		RetainShards:   make([]int, 0),
-		ConfigNum: 1,
+		ConfigNum:      1,
 	}
 	//var commitIndex int
 	if d.Decode(&cks) != nil ||
@@ -398,10 +400,14 @@ func (kv *ShardKV) processMsg(applyMsg raft.ApplyMsg) {
 		kv.shardJoin(Msg.JoinOp)
 	case "ShardConf":
 		kv.shards.ConfigNum = Msg.ConfOp.ConfigNum
+		kv.shards.ShardReqSeqId = Msg.SeqId + 1
+		kv.shards.QueryDone = false
 	case "BeginShardLeave":
 		kv.beginShardLeave(Msg.LeaveOp, Msg.SeqId)
+		kv.shards.ShardReqSeqId = Msg.SeqId + 1
 	case "EndShardLeave":
 		kv.endShardLeave(Msg.LeaveOp, Msg.SeqId)
+		kv.shards.ShardReqSeqId = Msg.SeqId + 1
 	case "ShardInit":
 		if kv.shards.ConfigNum > Msg.InitOp.ConfigNum {
 			DPrintf("[ShardKV-%d-%d] already ShardInit, kv.shards=%v, Msg=%v", kv.gid, kv.me, kv.shards, Msg)
@@ -411,10 +417,12 @@ func (kv *ShardKV) processMsg(applyMsg raft.ApplyMsg) {
 			kv.shards.ShardReqSeqId = Msg.SeqId + 1
 			kv.shards.RetainShards = Msg.InitOp.Shards
 			kv.shards.ConfigNum = Msg.InitOp.ConfigNum + 1
+			kv.shards.QueryDone = false
 		}
-		if succ {
-			ck.seqId = Msg.SeqId + 1
-		}
+	}
+	if succ {
+		DPrintf("[ShardKV-%d-%d] update seqid ck.seqId=%d -> Msg.seqId=%d ", kv.gid, kv.me, ck.seqId, Msg.SeqId+1)
+		ck.seqId = Msg.SeqId + 1
 	}
 	kv.persist()
 }
@@ -429,6 +437,14 @@ func (kv *ShardKV) shardJoin(joinOp ShardJoinOp) {
 	for key, value := range joinOp.ShardData {
 		kv.dataSource[key] = value
 	}
+	// update request seq id
+	for clerkId, seqId := range joinOp.RequestMap {
+		ck := kv.GetCk(clerkId)
+		if ck.seqId < seqId {
+			DPrintf("[ShardKV-%d-%d] Update RequestSeqId, ck=%d update seqid=%d to %d", kv.gid, kv.me, clerkId, ck.seqId, seqId)
+			ck.seqId = seqId
+		}
+	}
 	// add shard config
 	for _, shard := range joinOp.Shards {
 		kv.addShard(shard, &kv.shards.RetainShards)
@@ -442,11 +458,13 @@ func (kv *ShardKV) shardJoin(joinOp ShardJoinOp) {
 	kv.shards.WaitJoinShards = joinAfterShards
 	if (len(kv.shards.TransferShards) == 0) && len(kv.shards.WaitJoinShards) == 0 {
 		kv.shards.ConfigNum = joinOp.ConfigNum + 1
+		kv.shards.QueryDone = false
 	}
 	DPrintf("[ShardKV-%d-%d] ShardChange ShardJoin addShards shards=%v, kv.shards=%v", kv.gid, kv.me, joinOp.Shards, kv.shards)
 }
 
 func (kv *ShardKV) transferShardsToGroup(shards []int, servers []string, configNum int) bool {
+	kv.mu.Lock()
 	data := make(map[string]string)
 	for _, moveShard := range shards {
 		for key, value := range kv.dataSource {
@@ -459,12 +477,20 @@ func (kv *ShardKV) transferShardsToGroup(shards []int, servers []string, configN
 	DPrintf("[ShardKV-%d-%d] invokeMoveShard shards=%v, data=%v", kv.gid, kv.me, shards, data)
 	// notify shard new owner
 	args := RequestMoveShard{
-		Data:    data,
-		SeqId:   kv.shards.ShardReqSeqId,
-		ClerkId: kv.shards.ShardReqId,
-		Shards:  shards,
+		Data:      data,
+		SeqId:     kv.shards.ShardReqSeqId,
+		ClerkId:   kv.shards.ShardReqId,
+		Shards:    shards,
 		ConfigNum: configNum,
 	}
+	args.RequestMap = make(map[int64]int)
+	for clerkId, clerk := range kv.shardkvClerks {
+		if clerkId == kv.shards.ShardReqId {
+			continue
+		}
+		args.RequestMap[clerkId] = clerk.seqId
+	}
+	kv.mu.Unlock()
 	reply := ReplyMoveShard{}
 	// todo when all server access fail
 	for {
@@ -492,7 +518,6 @@ func (kv *ShardKV) beginShardLeave(leaveOp ShardLeaveOp, seqId int) {
 		}
 	}
 	kv.shards.WaitJoinShards = leaveOp.WaitJoinShards
-	
 	DPrintf("[ShardKV-%d-%d] ShardChange ShardLeave, transferShards=%v kv.shards=%v", kv.gid, kv.me, leaveOp.LeaveShards, kv.shards)
 
 	_, isLeader := kv.rf.GetState()
@@ -515,7 +540,6 @@ func (kv *ShardKV) beginShardLeave(leaveOp ShardLeaveOp, seqId int) {
 				kv.mu.Unlock()
 			}
 			kv.mu.Lock()
-			kv.shards.ShardReqSeqId = reqSeqId + 1
 			kv.rf.Start(Op{
 				Command: "EndShardLeave",
 				ClerkId: shardReqId,
@@ -535,6 +559,7 @@ func (kv *ShardKV) endShardLeave(leaveOp ShardLeaveOp, seqId int) {
 	// update shards, only update the leave shard , the join shard need to update by shardjoin msg from the channel
 	if len(kv.shards.WaitJoinShards) == 0 {
 		kv.shards.ConfigNum = leaveOp.ConfigNum + 1
+		kv.shards.QueryDone = false
 	}
 	afterShards := make([]int, 0)
 	for _, shard := range kv.shards.RetainShards {
@@ -543,7 +568,6 @@ func (kv *ShardKV) endShardLeave(leaveOp ShardLeaveOp, seqId int) {
 		}
 		afterShards = append(afterShards, shard)
 	}
-	kv.shards.ShardReqSeqId = seqId + 1
 	kv.shards.RetainShards = afterShards
 	DPrintf("[ShardKV-%d-%d] ShardChange endShardLeave finish, transferShards=%v, RetainShards=%v, kv.shards=%v", kv.gid, kv.me, leaveOp.LeaveShards, afterShards, kv.shards)
 	kv.shards.TransferShards = make([]int, 0)
@@ -577,7 +601,7 @@ func (kv *ShardKV) RequestMoveShard(args *RequestMoveShard, reply *ReplyMoveShar
 	kv.mu.Lock()
 	DPrintf("[ShardKV-%d-%d] Received Req MoveShard %v, SeqId=%d kv.shards=%v", kv.gid, kv.me, args, args.SeqId, kv.shards)
 	reply.Err = OK
-	// check request repeat ? 
+	// check request repeat ?
 	ck := kv.GetCk(args.ClerkId)
 	if ck.seqId > args.SeqId || kv.shards.ConfigNum != args.ConfigNum {
 		DPrintf("[ShardKV-%d-%d] Received Req MoveShard %v, SeqId=%d, ck.seqId=%d, already process request", kv.gid, kv.me, args, args.SeqId, ck.seqId)
@@ -589,11 +613,19 @@ func (kv *ShardKV) RequestMoveShard(args *RequestMoveShard, reply *ReplyMoveShar
 		return
 	}
 
+	// config not query finish, waiting, let them retry
+	if !kv.shards.QueryDone {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
 	// start a command
 	shardJoinOp := ShardJoinOp{
-		Shards:    args.Shards,
-		ShardData: args.Data,
-		ConfigNum: args.ConfigNum,
+		Shards:     args.Shards,
+		ShardData:  args.Data,
+		ConfigNum:  args.ConfigNum,
+		RequestMap: args.RequestMap,
 	}
 	logIndex, _, isLeader := kv.rf.Start(Op{
 		Command: "ShardJoin",
@@ -643,6 +675,7 @@ func (kv *ShardKV) checkConfig(config shardctrler.Config) {
 		return
 	}
 
+	kv.shards.QueryDone = true
 	kvShards := make([]int, 0)
 	waitJoinShards := make([]int, 0)
 	// collect group shards
@@ -675,7 +708,7 @@ func (kv *ShardKV) checkConfig(config shardctrler.Config) {
 			ClerkId: nrand(),
 			SeqId:   kv.shards.ShardReqSeqId,
 			InitOp: ShardInitOp{
-				Shards: kvShards,
+				Shards:    kvShards,
 				ConfigNum: config.Num,
 			},
 		})
@@ -695,15 +728,15 @@ func (kv *ShardKV) checkConfig(config shardctrler.Config) {
 		return
 	}
 
-	if len(leaveShards) != 0 || len(waitJoinShards) != 0 {	
+	if len(leaveShards) != 0 || len(waitJoinShards) != 0 {
 		op := Op{
 			Command: "BeginShardLeave",
 			ClerkId: kv.shards.ShardReqId,
 			SeqId:   kv.shards.ShardReqSeqId,
 			LeaveOp: ShardLeaveOp{
-				LeaveShards:  leaveShards,
-				Servers: config.Groups,
-				ConfigNum: config.Num,
+				LeaveShards:    leaveShards,
+				Servers:        config.Groups,
+				ConfigNum:      config.Num,
 				WaitJoinShards: waitJoinShards,
 			},
 		}
@@ -784,8 +817,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.shards = ShardContainer{
 		RetainShards:   make([]int, 0),
 		TransferShards: make([]int, 0),
-		ShardReqSeqId: 1,
-		ConfigNum: -1,
+		ShardReqSeqId:  1,
+		ConfigNum:      -1,
 	}
 	kv.persister = persister
 
