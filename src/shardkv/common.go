@@ -52,6 +52,8 @@ type RequestMoveShard struct {
 	ClerkId int64
 	SeqId   int
 	Shards  []int
+	RequestMap map[int64]int
+	ConfigNum int
 }
 
 type ReplyMoveShard struct {

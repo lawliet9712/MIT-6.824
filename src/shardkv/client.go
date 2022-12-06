@@ -75,11 +75,17 @@ func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
 	args.ClerkId = ck.ckId
+	requestMap := make(map[int]int)
 
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
-		args.SeqId = ck.allocSeqId(gid)
+		if seqId, found := requestMap[gid]; found {
+			args.SeqId = seqId
+		} else {
+			args.SeqId = ck.allocSeqId(gid)
+			requestMap[gid] = args.SeqId
+		}
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
@@ -99,8 +105,6 @@ func (ck *Clerk) Get(key string) string {
 		// ask controler for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
-
-	return ""
 }
 
 // shared by Put and Append.
@@ -111,11 +115,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Value = value
 	args.Op = op
 	args.ClerkId = ck.ckId
+	requestMap := make(map[int]int)
 
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
-		args.SeqId = ck.allocSeqId(gid)
+		if seqId, found := requestMap[gid]; found {
+			args.SeqId = seqId
+		} else {
+			args.SeqId = ck.allocSeqId(gid)
+			requestMap[gid] = args.SeqId
+		}
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
