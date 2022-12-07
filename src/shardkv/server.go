@@ -519,13 +519,13 @@ func (kv *ShardKV) beginShardLeave(leaveOp ShardLeaveOp, seqId int) {
 	}
 	kv.shards.WaitJoinShards = leaveOp.WaitJoinShards
 	DPrintf("[ShardKV-%d-%d] ShardChange ShardLeave, transferShards=%v kv.shards=%v", kv.gid, kv.me, leaveOp.LeaveShards, kv.shards)
-
+	kv.shards.QueryDone = true
+	
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
 		DPrintf("[ShardKV-%d-%d] not leader, ignore leaveOp %v", kv.gid, kv.me, leaveOp)
 		return
 	}
-
 	if len(leaveOp.LeaveShards) != 0 {
 		go func(shardReqId int64, op ShardLeaveOp, reqSeqId int) {
 			for gid, shards := range leaveOp.LeaveShards {
@@ -675,7 +675,6 @@ func (kv *ShardKV) checkConfig(config shardctrler.Config) {
 		return
 	}
 
-	kv.shards.QueryDone = true
 	kvShards := make([]int, 0)
 	waitJoinShards := make([]int, 0)
 	// collect group shards
@@ -742,6 +741,8 @@ func (kv *ShardKV) checkConfig(config shardctrler.Config) {
 		}
 		DPrintf("[ShardKV-%d-%d] ConfigChange, BeginShardLeave=%v, kv.shards=%v, config=%v", kv.gid, kv.me, op, kv.shards, config)
 		kv.rf.Start(op)
+	} else {
+		kv.shards.QueryDone = true
 	}
 }
 
