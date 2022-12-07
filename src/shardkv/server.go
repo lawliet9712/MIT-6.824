@@ -568,6 +568,16 @@ func (kv *ShardKV) endShardLeave(leaveOp ShardLeaveOp, seqId int) {
 		}
 		afterShards = append(afterShards, shard)
 	}
+	// delete data
+	deleteKeys := make([]string, 0)
+	for key := range kv.dataSource {
+		if isShardInGroup(key2shard(key), kv.shards.TransferShards) {
+			deleteKeys = append(deleteKeys, key)
+		}
+	}
+	for _, deleteKey := range deleteKeys {
+		delete(kv.dataSource, deleteKey)
+	}
 	kv.shards.RetainShards = afterShards
 	DPrintf("[ShardKV-%d-%d] ShardChange endShardLeave finish, transferShards=%v, RetainShards=%v, kv.shards=%v", kv.gid, kv.me, leaveOp.LeaveShards, afterShards, kv.shards)
 	kv.shards.TransferShards = make([]int, 0)
