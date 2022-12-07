@@ -361,13 +361,13 @@ func (kv *ShardKV) processMsg(applyMsg raft.ApplyMsg) {
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	_, isLeader := kv.rf.GetState()
 	if kv.needSnapshot() {
 		DPrintf("[ShardKV-%d-%d] size=%d, maxsize=%d, DoSnapshot %v", kv.gid, kv.me, kv.persister.RaftStateSize(), kv.maxraftstate, applyMsg)
 		kv.saveKVState(applyMsg.CommandIndex - 1)
 	}
 
 	ck := kv.GetCk(Msg.ClerkId)
-	_, isLeader := kv.rf.GetState()
 	needNotify := ck.msgUniqueId == applyMsg.CommandIndex
 	if isLeader && needNotify {
 		ck.msgUniqueId = 0
@@ -409,7 +409,7 @@ func (kv *ShardKV) processMsg(applyMsg raft.ApplyMsg) {
 		kv.endShardLeave(Msg.LeaveOp, Msg.SeqId)
 		kv.shards.ShardReqSeqId = Msg.SeqId + 1
 	case "ShardInit":
-		if kv.shards.ConfigNum > Msg.InitOp.ConfigNum {
+		if kv.shards.ConfigNum > 1 {
 			DPrintf("[ShardKV-%d-%d] already ShardInit, kv.shards=%v, Msg=%v", kv.gid, kv.me, kv.shards, Msg)
 		} else {
 			DPrintf("[ShardKV-%d-%d] ShardChange, ShardInit, kv.shards before=%v, after=%v", kv.gid, kv.me, kv.shards, Msg)
@@ -501,8 +501,8 @@ func (kv *ShardKV) transferShardsToGroup(shards []int, servers []string, configN
 				DPrintf("[ShardKV-%d-%d] move shard finish ...", kv.gid, kv.me)
 				return true
 			}
+			time.Sleep(100 * time.Millisecond)
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -520,7 +520,7 @@ func (kv *ShardKV) beginShardLeave(leaveOp ShardLeaveOp, seqId int) {
 	kv.shards.WaitJoinShards = leaveOp.WaitJoinShards
 	DPrintf("[ShardKV-%d-%d] ShardChange ShardLeave, transferShards=%v kv.shards=%v", kv.gid, kv.me, leaveOp.LeaveShards, kv.shards)
 	kv.shards.QueryDone = true
-	
+
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
 		DPrintf("[ShardKV-%d-%d] not leader, ignore leaveOp %v", kv.gid, kv.me, leaveOp)
@@ -701,7 +701,7 @@ func (kv *ShardKV) checkConfig(config shardctrler.Config) {
 	DPrintf("[ShardKV-%d-%d] groupNewShards=%v, OldShards=%v, leaveShards=%v query config=%v", kv.gid, kv.me, kvShards, kv.shards, leaveShards, config)
 
 	// init config
-	if config.Num > kv.shards.ConfigNum {
+	if config.Num == 1 {
 		kv.rf.Start(Op{
 			Command: "ShardInit",
 			ClerkId: nrand(),
@@ -819,7 +819,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		RetainShards:   make([]int, 0),
 		TransferShards: make([]int, 0),
 		ShardReqSeqId:  1,
-		ConfigNum:      -1,
+		ConfigNum:      1,
 	}
 	kv.persister = persister
 

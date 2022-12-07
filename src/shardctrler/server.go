@@ -72,7 +72,7 @@ func (sc *ShardCtrler) GetCk(ckId int64) *ShardClerk {
 
 func (sc *ShardCtrler) WaitApplyMsgByCh(ck *ShardClerk) (Op, bool) {
 	startTerm, _ := sc.rf.GetState()
-	timer := time.NewTimer(1000 * time.Millisecond)
+	timer := time.NewTimer(120 * time.Millisecond)
 	for {
 		select {
 		case Msg := <-ck.messageCh:
@@ -85,7 +85,7 @@ func (sc *ShardCtrler) WaitApplyMsgByCh(ck *ShardClerk) (Op, bool) {
 				sc.mu.Unlock()
 				return Op{}, true
 			}
-			timer.Reset(1000 * time.Millisecond)
+			timer.Reset(120 * time.Millisecond)
 		}
 	}
 }
@@ -93,7 +93,7 @@ func (sc *ShardCtrler) WaitApplyMsgByCh(ck *ShardClerk) (Op, bool) {
 func (sc *ShardCtrler) NotifyApplyMsgByCh(ch chan Op, Msg Op) {
 	// we wait 200ms
 	// if notify timeout, then we ignore, because client probably send request to anthor server
-	timer := time.NewTimer(200 * time.Millisecond)
+	timer := time.NewTimer(120 * time.Millisecond)
 	select {
 	case ch <- Msg:
 		DPrintf("[ShardCtrler-%d] NotifyApplyMsgByCh finish , Msg=%v", sc.me, Msg)
@@ -179,28 +179,36 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
-	sc.mu.Lock()
+	//sc.mu.Lock()
 	DPrintf("[ShardCtrler-%d] Received Req [Query] args=%v", sc.me, args)
-	logIndex, _, isLeader := sc.rf.Start(Op{
-		SeqId:   args.SeqId,
-		Command: T_Query,
-		CkId:    args.CkId,
-	})
+	/*
+		logIndex, _, isLeader := sc.rf.Start(Op{
+			SeqId:   args.SeqId,
+			Command: T_Query,
+			CkId:    args.CkId,
+		})
+		if !isLeader {
+			reply.WrongLeader = true
+			DPrintf("[ShardCtrler-%d] not leader,  Req [Move] args=%v", sc.me, args)
+			sc.mu.Unlock()
+			return
+		}
+
+		ck := sc.GetCk(args.CkId)
+		ck.msgUniqueId = logIndex
+		sc.mu.Unlock()
+
+		_, WrongLeader := sc.WaitApplyMsgByCh(ck)
+	*/
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	_, isLeader := sc.rf.GetState()
 	if !isLeader {
 		reply.WrongLeader = true
 		DPrintf("[ShardCtrler-%d] not leader,  Req [Move] args=%v", sc.me, args)
-		sc.mu.Unlock()
 		return
 	}
-
-	ck := sc.GetCk(args.CkId)
-	ck.msgUniqueId = logIndex
-	sc.mu.Unlock()
-
-	_, WrongLeader := sc.WaitApplyMsgByCh(ck)
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	reply.WrongLeader = WrongLeader
+	reply.WrongLeader = false
 	reply.Config = sc.getConfig(args.Num)
 	DPrintf("[ShardCtrler-%d] Clerk-%d Do [Query] Reply Config=%v", sc.me, args.CkId, reply)
 }
@@ -425,7 +433,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.configs[0].Groups = map[int][]string{}
 
 	labgob.Register(Op{})
-	sc.applyCh = make(chan raft.ApplyMsg)
+	sc.applyCh = make(chan raft.ApplyMsg, 1000)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
 	// Your code here.
