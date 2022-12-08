@@ -623,6 +623,19 @@ func (kv *ShardKV) RequestMoveShard(args *RequestMoveShard, reply *ReplyMoveShar
 		return
 	}
 
+	// already add shard, but config num not change (sometime a config can trigger multi shard add from two group) 
+	alreadyAdd := true
+	for _, shard := range args.Shards {
+		if !isShardInGroup(shard, kv.shards.RetainShards) {
+			alreadyAdd = false
+			break
+		}
+	}
+	if alreadyAdd {
+		kv.mu.Unlock()
+		return
+	}
+
 	// config not query finish, waiting, let them retry
 	if !kv.shards.QueryDone {
 		reply.Err = ErrWrongLeader
