@@ -185,36 +185,28 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
-	//sc.mu.Lock()
-	DPrintf("[ShardCtrler-%d] Received Req [Query] args=%v", sc.me, args)
-	/*
-		logIndex, _, isLeader := sc.rf.Start(Op{
-			SeqId:   args.SeqId,
-			Command: T_Query,
-			CkId:    args.CkId,
-		})
-		if !isLeader {
-			reply.WrongLeader = true
-			DPrintf("[ShardCtrler-%d] not leader,  Req [Move] args=%v", sc.me, args)
-			sc.mu.Unlock()
-			return
-		}
-
-		ck := sc.GetCk(args.CkId)
-		ck.msgUniqueId = logIndex
-		sc.mu.Unlock()
-
-		_, WrongLeader := sc.WaitApplyMsgByCh(ck)
-	*/
-	_, isLeader := sc.rf.GetState()
 	sc.mu.Lock()
-	defer sc.mu.Unlock()
+	DPrintf("[ShardCtrler-%d] Received Req [Query] args=%v", sc.me, args)
+	logIndex, _, isLeader := sc.rf.Start(Op{
+		SeqId:   args.SeqId,
+		Command: T_Query,
+		CkId:    args.CkId,
+	})
 	if !isLeader {
 		reply.WrongLeader = true
 		DPrintf("[ShardCtrler-%d] not leader,  Req [Move] args=%v", sc.me, args)
+		sc.mu.Unlock()
 		return
 	}
-	reply.WrongLeader = false
+
+	ck := sc.GetCk(args.CkId)
+	ck.msgUniqueId = logIndex
+	sc.mu.Unlock()
+
+	_, WrongLeader := sc.WaitApplyMsgByCh(ck)
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	reply.WrongLeader = WrongLeader
 	reply.Config = sc.getConfig(args.Num)
 	DPrintf("[ShardCtrler-%d] Clerk-%d Do [Query] Reply Config=%v", sc.me, args.CkId, reply)
 }
