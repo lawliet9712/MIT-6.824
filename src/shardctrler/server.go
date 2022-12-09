@@ -116,15 +116,18 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	})
 	if !isLeader {
 		reply.WrongLeader = true
+		DPrintf("[ShardCtrler-%d] Received Req [Join] args=%v, not leader, return", sc.me, args)
 		sc.mu.Unlock()
 		return
 	}
 
 	ck := sc.GetCk(args.CkId)
 	ck.msgUniqueId = logIndex
-	sc.mu.Unlock()
 
+	DPrintf("[ShardCtrler-%d] Wait Req [Join] args=%v, ck.msgUniqueId = %d", sc.me, args, ck.msgUniqueId)
+	sc.mu.Unlock()
 	_, WrongLeader := sc.WaitApplyMsgByCh(ck)
+	DPrintf("[ShardCtrler-%d] Wait Req [Join] Result=%v", sc.me, WrongLeader)
 	reply.WrongLeader = WrongLeader
 }
 
@@ -140,16 +143,19 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	})
 	if !isLeader {
 		reply.WrongLeader = true
+		DPrintf("[ShardCtrler-%d] Received Req [Leave] args=%v, not leader, return", sc.me, args)
 		sc.mu.Unlock()
 		return
 	}
 
 	ck := sc.GetCk(args.CkId)
 	ck.msgUniqueId = logIndex
+	DPrintf("[ShardCtrler-%d] Wait Req [Leave] args=%v ck.msgUniqueId=%d", sc.me, args, ck.msgUniqueId)
 	sc.mu.Unlock()
 
 	_, WrongLeader := sc.WaitApplyMsgByCh(ck)
 	reply.WrongLeader = WrongLeader
+	DPrintf("[ShardCtrler-%d] Wait Req [Leave] Result=%v", sc.me, WrongLeader)
 }
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
@@ -200,9 +206,9 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 		_, WrongLeader := sc.WaitApplyMsgByCh(ck)
 	*/
+	_, isLeader := sc.rf.GetState()
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	_, isLeader := sc.rf.GetState()
 	if !isLeader {
 		reply.WrongLeader = true
 		DPrintf("[ShardCtrler-%d] not leader,  Req [Move] args=%v", sc.me, args)
@@ -387,18 +393,18 @@ func (sc *ShardCtrler) processMsg() {
 		sc.mu.Lock()
 		ck := sc.GetCk(opMsg.CkId)
 		// already process
-		DPrintf("[ShardCtrler-%d] Received Msg %v", sc.me, applyMsg)
-		if opMsg.SeqId < ck.seqId {
-			DPrintf("[ShardCtrler-%d] already process Msg %v finish ... ", sc.me, applyMsg)
-			sc.mu.Unlock()
-			continue
-		}
-
+		DPrintf("[ShardCtrler-%d] Received Msg %v, Isleader=%v", sc.me, applyMsg, isLeader)
 		if applyMsg.CommandIndex == ck.msgUniqueId && isLeader {
 			DPrintf("[ShardCtrler-%d] Ready Notify To %d Msg %v, msgUniqueId=%d", sc.me, opMsg.CkId, applyMsg, ck.msgUniqueId)
 			sc.NotifyApplyMsgByCh(ck.messageCh, opMsg)
 			DPrintf("[ShardCtrler-%d] Notify To %d Msg %v finish ... ", sc.me, opMsg.CkId, applyMsg)
 			ck.msgUniqueId = 0
+		}
+		
+		if opMsg.SeqId < ck.seqId {
+			DPrintf("[ShardCtrler-%d] already process Msg %v finish ... ", sc.me, applyMsg)
+			sc.mu.Unlock()
+			continue
 		}
 
 		ck.seqId = opMsg.SeqId + 1

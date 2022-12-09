@@ -56,6 +56,7 @@ func (ck *Clerk) Query(num int) Config {
 			var reply QueryReply
 			ok := srv.Call("ShardCtrler.Query", args, &reply)
 			if ok && reply.WrongLeader == false {
+				DPrintf("[Clerk-%d] call [Query] finish, args=%v", ck.ckId, args)
 				return reply.Config
 			}
 		}
@@ -70,13 +71,16 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	args.Servers = servers
 	args.CkId = ck.ckId
 	args.SeqId = ck.allocSeqId()
+	DPrintf("[Clerk-%d] call [Join], args=%v", ck.ckId, args)
 	ck.mu.Unlock()
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
+			DPrintf("[Clerk-%d] call [Join] to %v, args=%v", ck.ckId, srv, args)
 			var reply JoinReply
 			ok := srv.Call("ShardCtrler.Join", args, &reply)
 			if ok && reply.WrongLeader == false {
+				DPrintf("[Clerk-%d] call [Join] finish, args=%v", ck.ckId, args)
 				return
 			}
 		}
@@ -91,6 +95,7 @@ func (ck *Clerk) Leave(gids []int) {
 	args.GIDs = gids
 	args.SeqId = ck.allocSeqId()
 	args.CkId = ck.ckId
+	DPrintf("[Clerk-%d] call [Leave], args=%v", ck.ckId, args)
 	ck.mu.Unlock()
 	for {
 		// try each known server.
@@ -98,6 +103,7 @@ func (ck *Clerk) Leave(gids []int) {
 			var reply LeaveReply
 			ok := srv.Call("ShardCtrler.Leave", args, &reply)
 			if ok && reply.WrongLeader == false {
+				DPrintf("[Clerk-%d] call [Leave] finish, args=%v", ck.ckId, args)
 				return
 			}
 		}
