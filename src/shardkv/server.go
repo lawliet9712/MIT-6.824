@@ -30,7 +30,7 @@ type Op struct {
 	Command string
 	ClerkId int64
 	SeqId   int
-	LeaveOp ShardLeaveOp
+	LeaveOp ShardChangeOp
 	JoinOp  ShardJoinOp
 	InitOp  ShardInitOp
 	ConfOp  ShardConfOp
@@ -57,7 +57,7 @@ type ShardContainer struct {
 	ShardReqId     int64 // for local start a op
 }
 
-type ShardLeaveOp struct {
+type ShardChangeOp struct {
 	LeaveShards    map[int][]int //
 	WaitJoinShards []int
 	Servers        map[int][]string
@@ -402,11 +402,11 @@ func (kv *ShardKV) processMsg(applyMsg raft.ApplyMsg) {
 		kv.shards.ConfigNum = Msg.ConfOp.ConfigNum
 		kv.shards.ShardReqSeqId = Msg.SeqId + 1
 		kv.shards.QueryDone = false
-	case "BeginShardLeave":
-		kv.beginShardLeave(Msg.LeaveOp, Msg.SeqId)
+	case "ShardChange":
+		kv.shardChange(Msg.LeaveOp, Msg.SeqId)
 		kv.shards.ShardReqSeqId = Msg.SeqId + 1
-	case "EndShardLeave":
-		kv.endShardLeave(Msg.LeaveOp, Msg.SeqId)
+	case "ShardLeave":
+		kv.shardLeave(Msg.LeaveOp, Msg.SeqId)
 		kv.shards.ShardReqSeqId = Msg.SeqId + 1
 	case "ShardInit":
 		if kv.shards.ConfigNum > 1 {
@@ -506,7 +506,7 @@ func (kv *ShardKV) transferShardsToGroup(shards []int, servers []string, configN
 	}
 }
 
-func (kv *ShardKV) beginShardLeave(leaveOp ShardLeaveOp, seqId int) {
+func (kv *ShardKV) shardChange(leaveOp ShardChangeOp, seqId int) {
 	if leaveOp.ConfigNum != kv.shards.ConfigNum {
 		DPrintf("[ShardKV-%d-%d] ignore beginShardLeave old config, kv.shards=%v, leaveOp=%v", kv.gid, kv.me, kv.shards, leaveOp)
 		return
@@ -527,7 +527,7 @@ func (kv *ShardKV) beginShardLeave(leaveOp ShardLeaveOp, seqId int) {
 		return
 	}
 	if len(leaveOp.LeaveShards) != 0 {
-		go func(shardReqId int64, op ShardLeaveOp, reqSeqId int) {
+		go func(shardReqId int64, op ShardChangeOp, reqSeqId int) {
 			for gid, shards := range leaveOp.LeaveShards {
 				servers := leaveOp.Servers[gid]
 				ok := kv.transferShardsToGroup(shards, servers, leaveOp.ConfigNum)
@@ -541,7 +541,7 @@ func (kv *ShardKV) beginShardLeave(leaveOp ShardLeaveOp, seqId int) {
 			}
 			kv.mu.Lock()
 			kv.rf.Start(Op{
-				Command: "EndShardLeave",
+				Command: "ShardLeave",
 				ClerkId: shardReqId,
 				SeqId:   kv.shards.ShardReqSeqId,
 				LeaveOp: op,
@@ -551,7 +551,7 @@ func (kv *ShardKV) beginShardLeave(leaveOp ShardLeaveOp, seqId int) {
 	}
 }
 
-func (kv *ShardKV) endShardLeave(leaveOp ShardLeaveOp, seqId int) {
+func (kv *ShardKV) shardLeave(leaveOp ShardChangeOp, seqId int) {
 	if leaveOp.ConfigNum < kv.shards.ConfigNum {
 		DPrintf("[ShardKV-%d-%d] ignore beginShardLeave old config, kv.shards=%v, leaveOp=%v", kv.gid, kv.me, kv.shards, leaveOp)
 		return
@@ -579,7 +579,7 @@ func (kv *ShardKV) endShardLeave(leaveOp ShardLeaveOp, seqId int) {
 		delete(kv.dataSource, deleteKey)
 	}
 	kv.shards.RetainShards = afterShards
-	DPrintf("[ShardKV-%d-%d] ShardChange endShardLeave finish, transferShards=%v, RetainShards=%v, kv.shards=%v", kv.gid, kv.me, leaveOp.LeaveShards, afterShards, kv.shards)
+	DPrintf("[ShardKV-%d-%d] ShardChange shardLeave finish, transferShards=%v, RetainShards=%v, kv.shards=%v", kv.gid, kv.me, leaveOp.LeaveShards, afterShards, kv.shards)
 	kv.shards.TransferShards = make([]int, 0)
 	DPrintf("[ShardKV-%d-%d] Excute ShardLeave finish, leave shards=%v, kv.Shards=%v", kv.gid, kv.me, leaveOp, kv.shards)
 }
@@ -623,7 +623,7 @@ func (kv *ShardKV) RequestMoveShard(args *RequestMoveShard, reply *ReplyMoveShar
 		return
 	}
 
-	// already add shard, but config num not change (sometime a config can trigger multi shard add from two group) 
+	// already add shard, but config num not change (sometime a config can trigger multi shard add from two group)
 	alreadyAdd := true
 	for _, shard := range args.Shards {
 		if !isShardInGroup(shard, kv.shards.RetainShards) {
@@ -752,17 +752,17 @@ func (kv *ShardKV) checkConfig(config shardctrler.Config) {
 
 	if len(leaveShards) != 0 || len(waitJoinShards) != 0 {
 		op := Op{
-			Command: "BeginShardLeave",
+			Command: "ShardChange",
 			ClerkId: kv.shards.ShardReqId,
 			SeqId:   kv.shards.ShardReqSeqId,
-			LeaveOp: ShardLeaveOp{
+			LeaveOp: ShardChangeOp{
 				LeaveShards:    leaveShards,
 				Servers:        config.Groups,
 				ConfigNum:      config.Num,
 				WaitJoinShards: waitJoinShards,
 			},
 		}
-		DPrintf("[ShardKV-%d-%d] ConfigChange, BeginShardLeave=%v, kv.shards=%v, config=%v", kv.gid, kv.me, op, kv.shards, config)
+		DPrintf("[ShardKV-%d-%d] ConfigChange, ShardChange=%v, kv.shards=%v, config=%v", kv.gid, kv.me, op, kv.shards, config)
 		kv.rf.Start(op)
 	} else {
 		kv.shards.QueryDone = true
